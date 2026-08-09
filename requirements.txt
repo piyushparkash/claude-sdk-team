@@ -1,2 +1,4 @@
 claude-agent-sdk
 anyio
+python-telegram-bot
+python-dotenv
