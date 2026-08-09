@@ -48,10 +48,15 @@ python telegram_team.py
 Then message your bot on Telegram with a task.
 
 Key differences from `team.py`:
-- **Session persistence** — one `ClaudeSDKClient` stays connected across all
-  messages in the chat (not reconnected per message), so the team remembers
-  earlier turns. Context auto-compacts same as interactive Claude Code; no
-  config needed.
+- **Multi-user** — each Telegram chat gets its own `ChatSession` keyed by
+  `chat_id`: its own roster, its own hire/fire tools, its own live client +
+  `session_id`. Two people can message the bot independently; each starts
+  from an empty roster and builds their own team as their conversation goes,
+  with zero crossover between chats.
+- **Session persistence** — within a chat, one `ClaudeSDKClient` stays
+  connected across all its messages (not reconnected per message), so that
+  chat's team remembers earlier turns. Context auto-compacts same as
+  interactive Claude Code; no config needed.
 - **Empty roster at start** — no researcher/coder/reviewer exists until the
   lead hires them. For every task the lead is instructed to hire whichever
   specialist actually fits (the usual coder/reviewer pair for code, or
@@ -69,7 +74,9 @@ Key differences from `team.py`:
   Telegram's legacy Markdown mode only understands single `*bold*`. Rewritten
   before sending, with a plain-text fallback if an entity is unbalanced.
 - Token lives in `.env` (`TELEGRAM_BOT_TOKEN`, gitignored, never commit it).
-  First message locks the bot to that chat (a POC guard, not real auth).
+  Any chat that messages the bot gets its own session — no lock/allowlist
+  (a POC simplification, not real auth; add one before exposing this beyond
+  a couple of trusted chats).
 
 ### PreToolUse hook: enforcing two things prompt-only compliance couldn't
 
