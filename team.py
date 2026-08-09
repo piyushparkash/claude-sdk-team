@@ -26,10 +26,16 @@ from claude_agent_sdk import (
 # plain, no essay/report formatting — so the human can read a beat and
 # decide, instead of getting a wall of text to scroll through.
 CHAT_STYLE = (
-    "Write like a chat message, not a report: a few short sentences, plain "
-    "language, no long bullet essays or headers unless the content is truly "
-    "a list. If there's a lot to say, give the short version and add "
-    "'ask if you want more detail' rather than dumping everything."
+    "Write like a chat message, not a report. Hard limit: 3-5 sentences, "
+    "under ~80 words, unless you're outputting actual code (code blocks "
+    "don't count against this). No headers, no bold section titles, no "
+    "bullet list longer than 3 items — if you have more than 3 points, "
+    "pick the 3 that matter most and drop the rest, or fold them into "
+    "prose. Plain language, one idea flowing into the next, not a report "
+    "structure. If there's genuinely more to say than that, give the short "
+    "version and add 'ask if you want more detail' — never send the long "
+    "version by default. Before sending, cut it in half; if it's still "
+    "over the limit, cut it in half again."
 )
 
 # If a teammate needs input before it can keep going, it should sound like a
