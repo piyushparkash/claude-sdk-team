@@ -235,6 +235,11 @@ class ChatSession:
                 prompt=args["prompt"] + " " + CHAT_STYLE + " " + ONE_QUESTION_RULE,
                 tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
                 model="sonnet",
+                # AgentDefinition doesn't inherit the lead's permission_mode --
+                # without this, WebSearch/WebFetch get silently permission-denied
+                # (no interactive approver here) and the hire just claims it
+                # "doesn't have web access" instead of actually trying.
+                permissionMode="bypassPermissions",
             )
             self.role_name[role_key] = args["display_name"]
             self.role_emoji[args["display_name"]] = args.get("emoji") or DEFAULT_EMOJI
@@ -316,7 +321,11 @@ class ChatSession:
                     HookMatcher(matcher=DELEGATE_TOOL, hooks=[self._guard_delegation])
                 ]
             },
-            permission_mode="acceptEdits",
+            # "acceptEdits" only auto-approves file-edit tools -- WebSearch/
+            # WebFetch/Bash/etc still hit an unanswerable permission prompt
+            # (no interactive approver exists here) and get silently denied.
+            # This is a trusted single-operator POC, so bypass outright.
+            permission_mode="bypassPermissions",
             cwd=PROJECT_DIR,
             resume=self.session_id,
         )

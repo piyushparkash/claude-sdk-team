@@ -52,6 +52,11 @@ TEAM = {
         ),
         tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
         model="sonnet",
+        # AgentDefinition doesn't inherit the lead's permission_mode -- without
+        # this, WebSearch/WebFetch calls get silently permission-denied (no
+        # interactive approver exists here) and the subagent just gives up
+        # claiming it "doesn't have web access".
+        permissionMode="bypassPermissions",
     ),
     "coder": AgentDefinition(
         description="Writes or edits code/files for a well-scoped subtask.",
@@ -64,6 +69,7 @@ TEAM = {
         ),
         tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
         model="sonnet",
+        permissionMode="bypassPermissions",
     ),
     "reviewer": AgentDefinition(
         description="Reviews code/output for correctness and quality, reports issues.",
@@ -76,6 +82,7 @@ TEAM = {
         ),
         tools=["Read", "Grep", "Glob"],
         model="sonnet",
+        permissionMode="bypassPermissions",
     ),
 }
 
@@ -144,7 +151,10 @@ async def run(task: str) -> None:
         agents=TEAM,
         # Lead only needs to delegate + synthesize.
         allowed_tools=["Agent"],
-        permission_mode="acceptEdits",
+        # "acceptEdits" only auto-approves file-edit tools -- researcher's
+        # WebSearch/WebFetch still hit an unanswerable permission prompt (no
+        # interactive approver here) and get silently denied without this.
+        permission_mode="bypassPermissions",
         cwd=".",
     )
 
