@@ -57,6 +57,21 @@ Key differences from `team.py`:
   connected across all its messages (not reconnected per message), so that
   chat's team remembers earlier turns. Context auto-compacts same as
   interactive Claude Code; no config needed.
+- **Persistent delivery pump, not per-message polling.** A background task
+  reads `client.receive_messages()` (the raw, never-terminating stream) for
+  the whole life of the connection, instead of a fresh
+  `client.receive_response()` per Telegram message (which stops at each
+  turn's `ResultMessage`). This is what actually fixed a real bug: a
+  slow/async subagent completion delivered *after* that boundary used to
+  sit queued until the next message's `query()` resumed consumption —
+  looked exactly like the bot silently hanging until you sent something
+  else. Confirmed fixed in testing: the delayed reply now shows up on its
+  own after waiting, no follow-up message needed to unstick it.
+- **"Thinking" one-liners.** The same pump surfaces a subagent's own tool
+  calls while it works — `🔍 Researcher: (reading team.py)`, `(searching
+  code for 'X')`, `(running: npm test)` — instead of silence until the
+  final answer. Makes a multi-step delegation actually feel like watching
+  someone work, not a black box.
 - **Empty roster at start** — no researcher/coder/reviewer exists until the
   lead hires them. For every task the lead is instructed to hire whichever
   specialist actually fits (the usual coder/reviewer pair for code, or
@@ -86,12 +101,11 @@ instead of relying on prompt wording, since the model didn't reliably follow
 either instruction on its own:
 
 - **Background delegation.** The prompt says never set `run_in_background`,
-  but when it slipped through, the subagent's real result only surfaced at
-  the start of the *next* message's stream — nothing drains it in between —
-  which looked exactly like the bot silently hanging (confirmed live: a
-  reply took 5+ minutes and only appeared after sending an unrelated
-  follow-up message). The hook now force-rewrites `run_in_background` to
-  `False` on every `Agent` call, no exceptions.
+  but when it slipped through it made the "queued until the next message"
+  problem worse (see the persistent pump above, which was the deeper fix
+  for that class of bug). The hook now also force-rewrites
+  `run_in_background` to `False` on every `Agent` call, no exceptions —
+  belt and suspenders with the pump, not a replacement for it.
 - **Same-turn hire-then-delegate.** A hire (`add_teammate`) takes effect via
   a reconnect at the *end* of the turn, but the model would sometimes hire a
   role and then immediately try delegating to it within the same turn, get

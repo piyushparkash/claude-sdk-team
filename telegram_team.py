@@ -11,6 +11,16 @@ Multi-user: each Telegram chat gets its own isolated ChatSession (own
 roster, own client/session_id) keyed by chat_id — one user's team, hires,
 and conversation history never leak into another's.
 
+Delivery model: a persistent background pump reads client.receive_messages()
+(the raw, never-terminating stream) for the whole life of the connection,
+instead of a fresh client.receive_response() per Telegram message (which
+stops at each turn's ResultMessage). Anything delivered after that boundary
+— a slow/async subagent completion — used to sit queued until the next
+message's query() resumed consumption, which looked exactly like the bot
+silently hanging. The pump also surfaces a subagent's own tool calls
+(Read/Grep/WebSearch/...) as short "thinking" one-liners while it works,
+instead of silence until the final answer.
+
 Run: python telegram_team.py
 Then message your bot on Telegram.
 """
@@ -74,13 +84,101 @@ ROSTER_PROMPT_ADDENDUM = (
 )
 
 
+def _to_telegram_markdown(text: str) -> str:
+    """Claude writes GFM (**bold**, # headers, - lists); Telegram's legacy
+    Markdown mode only understands single *bold*/_italic_/`code`. Rewrite
+    the common bits so replies render instead of showing raw asterisks."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text, flags=re.DOTALL)  # **bold** -> *bold*
+    text = re.sub(r"^#{1,6}\s*(.+)$", r"*\1*", text, flags=re.MULTILINE)  # # Header -> *Header*
+    return text
+
+
+TELEGRAM_LIMIT = 4096
+CHUNK_SIZE = 3500  # margin below the limit for the bold prefix + markdown escaping
+
+
+def _chunk(text: str, size: int = CHUNK_SIZE) -> list[str]:
+    """Split on paragraph/line breaks where possible so code fences and
+    sentences don't get cut mid-way more than necessary."""
+    if len(text) <= size:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= size:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n\n", 0, size)
+        if cut == -1:
+            cut = text.rfind("\n", 0, size)
+        if cut == -1:
+            cut = size
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+
+# Housekeeping text the Agent tool emits, never meant for a user-facing reply
+# (normally suppressed by LEAD_PROMPT forbidding run_in_background; filtered
+# here too as a defensive fallback in case a background dispatch slips through).
+_INTERNAL_MARKERS = ("agentid:", "async agent launched", "output_file:")
+
+
+def _extract_result_text(content) -> str:
+    """A subagent's Agent-tool result is a list of text blocks: its real
+    reply, plus internal housekeeping blocks we don't want surfaced in chat."""
+    if isinstance(content, str):
+        content = [{"text": content}]
+    parts = []
+    for block in content or []:
+        text = block.get("text", "") if isinstance(block, dict) else str(block)
+        if any(marker in text.lower() for marker in _INTERNAL_MARKERS):
+            continue
+        parts.append(text)
+    text = "\n".join(p for p in parts if p.strip())
+    return text or "(picked up the task, working on it)"
+
+
+def _describe_tool_use(block: ToolUseBlock) -> str | None:
+    """Turn a subagent's own tool call into a short 'what I'm doing right
+    now' line, so the chat shows activity while it works instead of long
+    silence before one big final answer. Returns None for tools not worth
+    narrating (skips them quietly)."""
+    inp = block.input or {}
+    if block.name == "Read":
+        return f"(reading `{inp.get('file_path', '?')}`)"
+    if block.name == "Write":
+        return f"(writing `{inp.get('file_path', '?')}`)"
+    if block.name == "Edit":
+        return f"(editing `{inp.get('file_path', '?')}`)"
+    if block.name == "Grep":
+        return f"(searching code for '{inp.get('pattern', '?')}')"
+    if block.name == "Glob":
+        return f"(listing files matching '{inp.get('pattern', '?')}')"
+    if block.name == "WebSearch":
+        return f"(searching the web: '{inp.get('query', '?')}')"
+    if block.name == "WebFetch":
+        return f"(reading {inp.get('url', '?')})"
+    if block.name == "Bash":
+        cmd = (inp.get("command") or "?").strip()
+        return f"(running: `{cmd[:60]}{'…' if len(cmd) > 60 else ''}`)"
+    return None
+
+
 class ChatSession:
     """Everything scoped to one Telegram chat: its own roster, emoji/name
     tags, live client + session_id, and the hire/fire tools + PreToolUse
     hook bound to *this* session's state (closures, not module globals) so
-    two chats never see or affect each other's team."""
+    two chats never see or affect each other's team.
 
-    def __init__(self) -> None:
+    Delivery runs on a persistent background pump (`_pump`) reading
+    `receive_messages()` for the connection's whole lifetime, rather than a
+    fresh `receive_response()` per incoming Telegram message — see module
+    docstring for why that boundary was the actual bug."""
+
+    def __init__(self, chat_id: int) -> None:
+        self.chat_id = chat_id
+        self.bot = None  # set on first message (python-telegram-bot's Bot instance)
+
         # Roster starts empty — lead hires whatever a task actually needs.
         self.team: dict[str, AgentDefinition] = {}
         self.role_name: dict[str, str] = {}
@@ -92,7 +190,9 @@ class ChatSession:
         self.session_id: str | None = None
         self.pending_reconnect = False
         self.freshly_hired: set[str] = set()  # hired this turn, not yet live in the CLI session
-        self.turn_lock = asyncio.Lock()  # serialize this chat's turns
+        self.pending: dict[str, str] = {}  # tool_use_id -> role, for delegations awaiting a result
+        self.lock = asyncio.Lock()  # guards client/pump setup, teardown, and query() calls
+        self.pump_task: asyncio.Task | None = None
 
         self.admin_server = create_sdk_mcp_server(
             name="team-admin", version="1.0.0", tools=self._make_admin_tools()
@@ -100,6 +200,23 @@ class ChatSession:
 
     def tag(self, role: str) -> str:
         return f"{self.role_emoji.get(role, DEFAULT_EMOJI)} {role}"
+
+    async def send(self, role: str, text: str) -> None:
+        text = text.strip()
+        if not text or self.bot is None:
+            return
+        prefix = self.tag(role)
+        for i, part in enumerate(_chunk(text)):
+            await self.bot.send_chat_action(chat_id=self.chat_id, action="typing")
+            await asyncio.sleep(0.3)
+            head = f"*{prefix}:* " if i == 0 else ""  # continuation chunks skip the name
+            body = f"{head}{_to_telegram_markdown(part)}"
+            try:
+                await self.bot.send_message(chat_id=self.chat_id, text=body, parse_mode=ParseMode.MARKDOWN)
+            except BadRequest:
+                # Unbalanced markdown entity (e.g. a stray "*" in code) -> send raw, never drop the message.
+                raw_head = f"{prefix}: " if i == 0 else ""
+                await self.bot.send_message(chat_id=self.chat_id, text=f"{raw_head}{part}")
 
     # --- hire / fire tools, run in-process, bound to this session's roster ---
 
@@ -149,8 +266,9 @@ class ChatSession:
         "the bot hung" from the Telegram side:
 
         1. Never background a delegation. If it's ignored, the real result
-           only shows up at the start of the *next* message's stream
-           (nothing drains it in between) — looks like a silent hang.
+           only shows up once something later drains the raw stream again
+           — the pump now does this continuously, but there's no reason to
+           rely on that when the tool call can just be forced synchronous.
         2. Never delegate to a role hired earlier this same turn — the CLI
            session's agent list is a snapshot from connect() time, so a
            same-turn hire isn't live yet. Without this, the model was
@@ -203,25 +321,103 @@ class ChatSession:
             resume=self.session_id,
         )
 
-    async def get_client(self) -> ClaudeSDKClient:
-        if self.client is None:
+    # --- connection + persistent pump lifecycle -------------------------
+
+    async def ensure_ready(self) -> ClaudeSDKClient:
+        """Connect (or reconnect after a roster change) and make sure the
+        background pump is running, all under one lock so a query() call
+        never races a reconnect swapping the client out from under it."""
+        async with self.lock:
+            if self.client is None:
+                client = ClaudeSDKClient(options=self._build_options())
+                await client.connect()
+                self.client = client
+                self.pump_task = asyncio.create_task(self._pump())
+            return self.client
+
+    async def _reconnect_locked(self) -> None:
+        """Drop and rebuild the client (new roster), resuming the same
+        session. Must run under self.lock (called from the pump itself via
+        a detached task, since the pump can't cancel/await its own task)."""
+        async with self.lock:
+            old_client, old_pump = self.client, self.pump_task
+            self.client, self.pump_task = None, None
+            if old_pump is not None:
+                old_pump.cancel()
+            if old_client is not None:
+                await old_client.disconnect()
             client = ClaudeSDKClient(options=self._build_options())
             await client.connect()
             self.client = client
-        return self.client
-
-    async def reconnect_client(self) -> None:
-        """Drop and rebuild the client (new roster), resuming the same session."""
-        old = self.client
-        self.client = None
-        if old is not None:
-            await old.disconnect()
-        await self.get_client()
+            self.pump_task = asyncio.create_task(self._pump())
+            self.freshly_hired.clear()  # this reconnect is exactly what makes them live
 
     async def disconnect(self) -> None:
-        if self.client is not None:
-            await self.client.disconnect()
-            self.client = None
+        async with self.lock:
+            if self.pump_task is not None:
+                self.pump_task.cancel()
+                self.pump_task = None
+            if self.client is not None:
+                await self.client.disconnect()
+                self.client = None
+
+    async def query(self, task: str) -> None:
+        await self.ensure_ready()
+        async with self.lock:
+            if self.client is not None:
+                await self.client.query(task)
+
+    async def _pump(self) -> None:
+        """Runs for the whole life of the connection, independent of any
+        single Telegram message's turn boundary — this is what actually
+        fixes the "reply only shows up after I send another message" bug:
+        receive_response() stops at each ResultMessage, so anything
+        delivered after that point just sat queued until the next query()
+        resumed consumption. receive_messages() never stops on its own."""
+        try:
+            async for message in self.client.receive_messages():
+                try:
+                    await self._handle_message(message)
+                except Exception as exc:
+                    await self.send("Lead", f"(error handling an update) {exc}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_message(self, message) -> None:
+        if isinstance(message, AssistantMessage):
+            if message.parent_tool_use_id is None:
+                # the lead's own turn
+                self.session_id = message.session_id or self.session_id
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        await self.send("Lead", block.text)
+                    elif isinstance(block, ToolUseBlock) and block.name == DELEGATE_TOOL:
+                        role = self.role_name.get(block.input.get("subagent_type", ""), "Agent")
+                        desc = block.input.get("description", "a subtask")
+                        self.pending[block.id] = role
+                        await self.send("Lead", f"(delegating to {role}) {desc}")
+            else:
+                # a subagent's own activity, mid-delegation -> a "thinking" one-liner
+                role = self.pending.get(message.parent_tool_use_id)
+                if role:
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            note = _describe_tool_use(block)
+                            if note:
+                                await self.send(role, note)
+
+        elif isinstance(message, UserMessage) and isinstance(message.content, list):
+            if message.parent_tool_use_id is None:
+                for block in message.content:
+                    if isinstance(block, ToolResultBlock) and block.tool_use_id in self.pending:
+                        role = self.pending.pop(block.tool_use_id)
+                        await self.send(role, _extract_result_text(block.content))
+
+        elif isinstance(message, ResultMessage):
+            self.session_id = message.session_id or self.session_id
+            if self.pending_reconnect:
+                self.pending_reconnect = False
+                asyncio.create_task(self._reconnect_locked())
 
 
 # One ChatSession per Telegram chat_id — fully isolated rosters/sessions.
@@ -232,121 +428,10 @@ def get_session(chat_id: int) -> tuple[ChatSession, bool]:
     """Returns (session, created_now)."""
     session = _sessions.get(chat_id)
     if session is None:
-        session = ChatSession()
+        session = ChatSession(chat_id)
         _sessions[chat_id] = session
         return session, True
     return session, False
-
-
-def _to_telegram_markdown(text: str) -> str:
-    """Claude writes GFM (**bold**, # headers, - lists); Telegram's legacy
-    Markdown mode only understands single *bold*/_italic_/`code`. Rewrite
-    the common bits so replies render instead of showing raw asterisks."""
-    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text, flags=re.DOTALL)  # **bold** -> *bold*
-    text = re.sub(r"^#{1,6}\s*(.+)$", r"*\1*", text, flags=re.MULTILINE)  # # Header -> *Header*
-    return text
-
-
-TELEGRAM_LIMIT = 4096
-CHUNK_SIZE = 3500  # margin below the limit for the bold prefix + markdown escaping
-
-
-def _chunk(text: str, size: int = CHUNK_SIZE) -> list[str]:
-    """Split on paragraph/line breaks where possible so code fences and
-    sentences don't get cut mid-way more than necessary."""
-    if len(text) <= size:
-        return [text]
-    chunks = []
-    while text:
-        if len(text) <= size:
-            chunks.append(text)
-            break
-        cut = text.rfind("\n\n", 0, size)
-        if cut == -1:
-            cut = text.rfind("\n", 0, size)
-        if cut == -1:
-            cut = size
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    return chunks
-
-
-async def send(bot, chat_id: int, session: ChatSession, role: str, text: str) -> None:
-    text = text.strip()
-    if not text:
-        return
-    prefix = session.tag(role)
-    parts = _chunk(text)
-    for i, part in enumerate(parts):
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        await asyncio.sleep(0.5)  # feels like someone typing, and avoids flooding
-        head = f"*{prefix}:* " if i == 0 else ""  # continuation chunks skip the name
-        body = f"{head}{_to_telegram_markdown(part)}"
-        try:
-            await bot.send_message(chat_id=chat_id, text=body, parse_mode=ParseMode.MARKDOWN)
-        except BadRequest:
-            # Unbalanced markdown entity (e.g. a stray "*" in code) -> send raw, never drop the message.
-            raw_head = f"{prefix}: " if i == 0 else ""
-            await bot.send_message(chat_id=chat_id, text=f"{raw_head}{part}")
-
-
-# Housekeeping text the Agent tool emits, never meant for a user-facing reply
-# (normally suppressed by LEAD_PROMPT forbidding run_in_background; filtered
-# here too as a defensive fallback in case a background dispatch slips through).
-_INTERNAL_MARKERS = ("agentid:", "async agent launched", "output_file:")
-
-
-def _extract_result_text(content) -> str:
-    """A subagent's Agent-tool result is a list of text blocks: its real
-    reply, plus internal housekeeping blocks we don't want surfaced in chat."""
-    if isinstance(content, str):
-        content = [{"text": content}]
-    parts = []
-    for block in content or []:
-        text = block.get("text", "") if isinstance(block, dict) else str(block)
-        if any(marker in text.lower() for marker in _INTERNAL_MARKERS):
-            continue
-        parts.append(text)
-    text = "\n".join(p for p in parts if p.strip())
-    return text or "(picked up the task, working on it)"
-
-
-async def run_team(bot, chat_id: int, session: ChatSession, task: str) -> None:
-    client = await session.get_client()
-    pending: dict[str, str] = {}  # tool_use_id -> subagent_type, this turn
-    session.freshly_hired.clear()  # any hire from a prior turn is live by now
-
-    async with session.turn_lock:
-        await client.query(task)
-
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
-                session.session_id = message.session_id or session.session_id
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        await send(bot, chat_id, session, "Lead", block.text)
-                    elif isinstance(block, ToolUseBlock) and block.name == DELEGATE_TOOL:
-                        role = session.role_name.get(block.input.get("subagent_type", ""), "Agent")
-                        desc = block.input.get("description", "a subtask")
-                        pending[block.id] = role
-                        await send(bot, chat_id, session, "Lead", f"(delegating to {role}) {desc}")
-
-            elif (
-                isinstance(message, UserMessage)
-                and message.parent_tool_use_id is None
-                and isinstance(message.content, list)
-            ):
-                for block in message.content:
-                    if isinstance(block, ToolResultBlock) and block.tool_use_id in pending:
-                        role = pending.pop(block.tool_use_id)
-                        await send(bot, chat_id, session, role, _extract_result_text(block.content))
-
-            elif isinstance(message, ResultMessage):
-                session.session_id = message.session_id or session.session_id
-
-    if session.pending_reconnect:
-        session.pending_reconnect = False
-        await session.reconnect_client()
 
 
 def _roster_message(session: ChatSession) -> str:
@@ -367,6 +452,7 @@ def _roster_message(session: ChatSession) -> str:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     session, created_now = get_session(chat_id)
+    session.bot = context.bot
 
     if created_now:
         try:
@@ -376,9 +462,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except BadRequest:
             await context.bot.send_message(chat_id=chat_id, text=_roster_message(session))
 
-    task = update.message.text
     try:
-        await run_team(context.bot, chat_id, session, task)
+        await session.query(update.message.text)
     except Exception as exc:  # surface errors into the chat instead of dying silently
         await context.bot.send_message(chat_id=chat_id, text=f"*{session.tag('Lead')}:* (error) {exc}",
                                         parse_mode=ParseMode.MARKDOWN)
