@@ -71,6 +71,28 @@ Key differences from `team.py`:
 - Token lives in `.env` (`TELEGRAM_BOT_TOKEN`, gitignored, never commit it).
   First message locks the bot to that chat (a POC guard, not real auth).
 
+### PreToolUse hook: enforcing two things prompt-only compliance couldn't
+
+Two failure modes were traced to real bugs, both fixed with a `PreToolUse`
+hook on the `Agent` tool (`HookMatcher` + `updatedInput`/`permissionDecision`)
+instead of relying on prompt wording, since the model didn't reliably follow
+either instruction on its own:
+
+- **Background delegation.** The prompt says never set `run_in_background`,
+  but when it slipped through, the subagent's real result only surfaced at
+  the start of the *next* message's stream — nothing drains it in between —
+  which looked exactly like the bot silently hanging (confirmed live: a
+  reply took 5+ minutes and only appeared after sending an unrelated
+  follow-up message). The hook now force-rewrites `run_in_background` to
+  `False` on every `Agent` call, no exceptions.
+- **Same-turn hire-then-delegate.** A hire (`add_teammate`) takes effect via
+  a reconnect at the *end* of the turn, but the model would sometimes hire a
+  role and then immediately try delegating to it within the same turn, get
+  "agent type not found," and retry up to ~7 times before giving up — each
+  attempt a wasted round trip. The hook now denies delegation to any
+  role hired this turn, with a clear reason, so it stops after one attempt
+  instead of flailing.
+
 ### Known limitation: dynamic hiring isn't 100% reliable
 
 The "hire whoever fits before delegating" rule is prompt-engineered, not

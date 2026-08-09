@@ -33,6 +33,7 @@ from claude_agent_sdk import (
     ToolResultBlock,
     tool,
     create_sdk_mcp_server,
+    HookMatcher,
 )
 
 from team import LEAD_PROMPT, CHAT_STYLE, ONE_QUESTION_RULE
@@ -77,6 +78,7 @@ async def add_teammate(args: dict) -> dict:
     _role_name[role_key] = args["display_name"]
     _role_emoji[args["display_name"]] = args.get("emoji") or DEFAULT_EMOJI
     _state["pending_reconnect"] = True
+    _state["freshly_hired"].add(role_key)
     return {"content": [{"type": "text", "text": f"Hired {args['display_name']} ({role_key})."}]}
 
 
@@ -129,8 +131,55 @@ ROSTER_PROMPT_ADDENDUM = (
 # `client` is kept open across messages so the team remembers prior turns
 # (session persistence) instead of starting fresh every message. Reconnecting
 # (e.g. after a roster change) resumes the same session_id so context survives.
-_state = {"chat_id": None, "client": None, "session_id": None, "pending_reconnect": False}
+_state = {
+    "chat_id": None,
+    "client": None,
+    "session_id": None,
+    "pending_reconnect": False,
+    "freshly_hired": set(),  # role_keys hired this turn, not yet live in the CLI session
+}
 _turn_lock = asyncio.Lock()  # serialize turns; SDK client handles one query at a time
+
+
+async def _guard_delegation(hook_input, tool_use_id, context):
+    """PreToolUse hook on the Agent tool — enforces two things the prompt
+    only asks nicely for, because both failure modes look like "the bot
+    hung" from the Telegram side:
+
+    1. Never background a delegation. If it's ignored, the real result
+       only shows up at the start of the *next* message's stream (nothing
+       drains it in between) — looks like a silent hang.
+    2. Never delegate to a role hired earlier this same turn — the CLI
+       session's agent list is a snapshot from connect() time, so a
+       same-turn hire isn't live yet. Without this, the model was
+       observed retrying the same failing delegation ~7 times before
+       giving up, burning a full round-trip each time.
+    """
+    tool_input = hook_input.get("tool_input", {})
+
+    subagent_type = tool_input.get("subagent_type")
+    if subagent_type in _state["freshly_hired"]:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"'{subagent_type}' was just hired this turn and isn't live yet "
+                    "(takes effect next message). Stop retrying — tell the user "
+                    "you're waiting on them to send another message, then stop."
+                ),
+            }
+        }
+
+    if tool_input.get("run_in_background"):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {**tool_input, "run_in_background": False},
+            }
+        }
+    return {}
 
 
 def _build_options() -> ClaudeAgentOptions:
@@ -143,6 +192,11 @@ def _build_options() -> ClaudeAgentOptions:
             "mcp__team-admin__add_teammate",
             "mcp__team-admin__remove_teammate",
         ],
+        hooks={
+            "PreToolUse": [
+                HookMatcher(matcher=DELEGATE_TOOL, hooks=[_guard_delegation])
+            ]
+        },
         permission_mode="acceptEdits",
         cwd=PROJECT_DIR,
         resume=_state["session_id"],
@@ -242,6 +296,7 @@ def _extract_result_text(content) -> str:
 async def run_team(bot, chat_id: str, task: str) -> None:
     client = await get_client()
     pending: dict[str, str] = {}  # tool_use_id -> subagent_type, this turn
+    _state["freshly_hired"].clear()  # any hire from a prior turn is live by now
 
     async with _turn_lock:
         await client.query(task)
