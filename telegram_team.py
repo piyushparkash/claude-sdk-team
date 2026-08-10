@@ -43,7 +43,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
-from team import CHAT_STYLE
+from team import CHAT_STYLE, ONE_QUESTION_RULE
 
 load_dotenv()
 
@@ -70,7 +70,8 @@ GROUPCHAT_RULES = (
     "-- never tack it onto the end of a real message; if you have something "
     "to say, just say it and stop, don't also append PASS after it. Only "
     "speak when it adds real value -- don't acknowledge, restate what was "
-    "just said, or say 'sounds good' for the sake of it. " + CHAT_STYLE
+    "just said, or say 'sounds good' for the sake of it. "
+    + CHAT_STYLE + " " + ONE_QUESTION_RULE
 )
 
 LEAD_GROUPCHAT_PROMPT = (
@@ -158,6 +159,42 @@ def _chunk(text: str, size: int = CHUNK_SIZE) -> list[str]:
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
     return chunks
+
+
+# Prompt-only enforcement of "max 3 sentences per message" wasn't reliably
+# followed for information-dense answers (confirmed live: a 700-char,
+# 4-point financial breakdown despite the limit). Enforced here instead by
+# splitting into multiple short bursts -- like a person sending several
+# quick texts in a row -- rather than truncating/losing content. Code
+# blocks are kept atomic (never split, don't count toward the sentence cap).
+MAX_SENTENCES_PER_BURST = 3
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# Lookbehind requires a non-digit before the punctuation so "1." / "2." list
+# markers (and mid-number periods like "8.2%", already protected by the
+# no-whitespace-after check) don't get mistaken for sentence boundaries.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[^\d\s][.!?])\s+(?=[A-Z\"'(])")
+
+
+def _group_prose(prose: str) -> list[str]:
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(prose) if s.strip()]
+    if not sentences:
+        return [prose] if prose.strip() else []
+    return [
+        " ".join(sentences[i:i + MAX_SENTENCES_PER_BURST])
+        for i in range(0, len(sentences), MAX_SENTENCES_PER_BURST)
+    ]
+
+
+def _split_into_bursts(text: str) -> list[str]:
+    """Alternates prose (grouped into <=3-sentence bursts) and code fences
+    (kept whole), preserving order, as a flat list of separate messages."""
+    bursts, pos = [], 0
+    for m in _CODE_FENCE_RE.finditer(text):
+        bursts.extend(_group_prose(text[pos:m.start()]))
+        bursts.append(m.group(0))
+        pos = m.end()
+    bursts.extend(_group_prose(text[pos:]))
+    return bursts or [text]
 
 
 def _describe_tool_use(block: ToolUseBlock) -> str | None:
@@ -271,6 +308,12 @@ class ChatSession:
         # discussion state, reset per human message
         self.wrap_up = False
         self.final_summary: str | None = None
+        # role_keys hired but not yet given a turn -- if wrap_up is set
+        # while this is non-empty, the close is rejected (see
+        # handle_human_message). The prompt tells the lead not to close in
+        # the same turn as a hire, but that wasn't reliably followed, so
+        # this is enforced structurally instead of hoped for.
+        self.newly_hired: set[str] = set()
 
         self.admin_server = create_sdk_mcp_server(
             name="team-admin", version="1.0.0", tools=self._make_admin_tools()
@@ -297,16 +340,20 @@ class ChatSession:
         if not text or self.bot is None:
             return
         prefix = self.tag(role_key)
-        for i, part in enumerate(_chunk(text)):
-            await self.bot.send_chat_action(chat_id=self.chat_id, action="typing")
-            await asyncio.sleep(0.3)
-            head = f"*{prefix}:* " if i == 0 else ""
-            body = f"{head}{_to_telegram_markdown(part)}"
-            try:
-                await self.bot.send_message(chat_id=self.chat_id, text=body, parse_mode=ParseMode.MARKDOWN)
-            except BadRequest:
-                raw_head = f"{prefix}: " if i == 0 else ""
-                await self.bot.send_message(chat_id=self.chat_id, text=f"{raw_head}{part}")
+        # Each burst is its own separate Telegram message (multi-bubble chat
+        # feel); _chunk() inside is just the char-limit safety net, rarely
+        # triggered now that bursts are already short.
+        for burst in _split_into_bursts(text):
+            for i, part in enumerate(_chunk(burst)):
+                await self.bot.send_chat_action(chat_id=self.chat_id, action="typing")
+                await asyncio.sleep(0.3)
+                head = f"*{prefix}:* " if i == 0 else ""
+                body = f"{head}{_to_telegram_markdown(part)}"
+                try:
+                    await self.bot.send_message(chat_id=self.chat_id, text=body, parse_mode=ParseMode.MARKDOWN)
+                except BadRequest:
+                    raw_head = f"{prefix}: " if i == 0 else ""
+                    await self.bot.send_message(chat_id=self.chat_id, text=f"{raw_head}{part}")
 
     # --- hire / fire / report_to_human, run in-process, bound to this session ---
 
@@ -327,6 +374,7 @@ class ChatSession:
                 system_prompt=_make_peer_prompt(role_key, args["description"], args["prompt"]),
                 tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
             )
+            self.newly_hired.add(role_key)
             return {"content": [{"type": "text", "text": f"Hired {args['display_name']} ({role_key}), live now."}]}
 
         @tool(
@@ -366,6 +414,7 @@ class ChatSession:
     async def handle_human_message(self, text: str) -> None:
         self.wrap_up = False
         self.final_summary = None
+        self.newly_hired.clear()
         transcript: list[tuple[str, str]] = [("human", f"(from the human) {text}")]
         last_seen: dict[str, int] = {}
         posted = 0
@@ -375,6 +424,14 @@ class ChatSession:
             new = transcript[seen:]
             last_seen[role_key] = len(transcript)
             return "\n".join(f"{self.tag(r)}: {t}" for r, t in new)
+
+        def reject_premature_wrapup() -> None:
+            # A hire that hasn't had its debut turn yet was still pending
+            # when report_to_human fired -- refuse the close and let the
+            # round continue so it actually gets to speak.
+            if self.wrap_up and self.newly_hired:
+                self.wrap_up = False
+                self.final_summary = None
 
         while posted < MAX_MESSAGES_PER_DISCUSSION and not self.wrap_up:
             round_had_speech = False
@@ -387,7 +444,9 @@ class ChatSession:
                 peer = self.peers.get(role_key)
                 if peer is None:
                     continue
+                self.newly_hired.discard(role_key)  # about to get its debut turn
                 reply = await peer.say(delta, on_note=lambda note, rk=role_key: self.send(rk, note))
+                reject_premature_wrapup()
                 if self.wrap_up:
                     break
                 if reply:
@@ -408,6 +467,7 @@ class ChatSession:
                 delta = delta_for(LEAD_KEY) or "(no new messages)"
                 nudge = delta + "\n\n(No one has anything to add. Decide now: call report_to_human, or say what happens next.)"
                 reply = await lead.say(nudge, on_note=lambda note: self.send(LEAD_KEY, note)) if lead else None
+                reject_premature_wrapup()
                 if self.wrap_up:
                     break
                 if reply:
