@@ -66,9 +66,11 @@ GROUPCHAT_RULES = (
     "expertise, a finding, a question, pushback on someone else -- post a "
     "short chat message. If you genuinely have nothing to add right now, "
     "reply with EXACTLY the single word PASS and nothing else, no "
-    "punctuation, no explanation. Only speak when it adds real value -- "
-    "don't acknowledge, restate what was just said, or say 'sounds good' "
-    "for the sake of it. " + CHAT_STYLE
+    "punctuation, no explanation. PASS must be your entire reply, standalone "
+    "-- never tack it onto the end of a real message; if you have something "
+    "to say, just say it and stop, don't also append PASS after it. Only "
+    "speak when it adds real value -- don't acknowledge, restate what was "
+    "just said, or say 'sounds good' for the sake of it. " + CHAT_STYLE
 )
 
 LEAD_GROUPCHAT_PROMPT = (
@@ -82,6 +84,16 @@ LEAD_GROUPCHAT_PROMPT = (
     "channel is your team's live working discussion, visible to them but "
     "not addressed to them directly. "
     "\n\n"
+    "Never write your own full summary/answer as a regular channel message "
+    "and then repeat it in report_to_human -- that sends the human the same "
+    "thing twice. Your regular channel messages should be brief working "
+    "notes (coordinating, asking a teammate something, reacting to a "
+    "finding) -- the moment you have something worth calling the final "
+    "answer, call report_to_human directly with it instead of posting it as "
+    "chat first. If you already posted something in the channel that turns "
+    "out to be the complete answer, call report_to_human right after with a "
+    "short pointer ('see above') rather than retyping it. "
+    "\n\n"
     "You start every session with ZERO teammates hired -- hire whoever a "
     "task actually needs via add_teammate before or during discussion (not "
     "as a blocking gate -- you can hire mid-discussion the moment you "
@@ -91,6 +103,14 @@ LEAD_GROUPCHAT_PROMPT = (
     "Write, Bash, or web tools yourself -- if actual work is needed "
     "(research, code, review, anything hands-on), that's what teammates are "
     "for; you coordinate, they execute. "
+    "\n\n"
+    "NEVER call report_to_human in the same turn you hire someone (or "
+    "right after hiring, before they've actually contributed) -- a "
+    "placeholder like 'waiting on the team' is not a real answer and closes "
+    "the discussion before your new hire ever got to speak. After you hire, "
+    "just stop your turn there (or PASS if you have nothing else to add "
+    "right now) -- the hire is live immediately and gets its own turn next; "
+    "wait for its actual reply before deciding whether to close out. "
     "\n\n"
     "If every teammate PASSes a full round and you're asked to decide: you "
     "may NOT also PASS at that point -- you must either call "
@@ -170,19 +190,29 @@ class AgentPeer:
     own memory across the whole chat (never reconnected), no delegation
     machinery -- just a participant in the shared channel."""
 
-    def __init__(self, role_key: str, system_prompt: str, allowed_tools: list[str],
-                 mcp_servers: dict | None = None):
+    def __init__(self, role_key: str, system_prompt: str, tools: list[str],
+                 mcp_servers: dict | None = None, mcp_tool_names: list[str] | None = None):
         self.role_key = role_key
         self.system_prompt = system_prompt
-        self.allowed_tools = allowed_tools
+        # `tools` is a HARD restriction on which built-in tools exist at all
+        # (ClaudeAgentOptions.tools) -- `allowed_tools` (below) only controls
+        # permission *prompting* and is a no-op once bypassPermissions is
+        # set, so it alone doesn't stop a peer from using tools outside its
+        # role. Confirmed live: lead (meant to have zero tools) used Read
+        # directly and wrote+reviewed code itself, no hire, no cross-talk,
+        # because `tools=` wasn't being set and bypassPermissions made the
+        # allowed_tools restriction meaningless.
+        self.tools = tools
         self.mcp_servers = mcp_servers or {}
+        self.mcp_tool_names = mcp_tool_names or []
         self.client: ClaudeSDKClient | None = None
 
     async def _ensure(self) -> ClaudeSDKClient:
         if self.client is None:
             options = ClaudeAgentOptions(
                 system_prompt=self.system_prompt,
-                allowed_tools=self.allowed_tools,
+                tools=self.tools,
+                allowed_tools=self.tools + self.mcp_tool_names,
                 mcp_servers=self.mcp_servers,
                 permission_mode="bypassPermissions",
                 cwd=PROJECT_DIR,
@@ -210,9 +240,13 @@ class AgentPeer:
             elif isinstance(message, ResultMessage):
                 pass
         text = "\n".join(p for p in parts if p.strip()).strip()
-        if not text or text.strip().upper() == "PASS":
+        if not text or text.upper() == "PASS":
             return None
-        return text
+        # Defensive cleanup: prompt says PASS must be standalone, but if a
+        # peer tacks a trailing "PASS" line onto real content anyway, strip
+        # it rather than leaking the literal word into the chat.
+        text = re.sub(r"\n+PASS\s*$", "", text, flags=re.IGNORECASE).strip()
+        return text or None
 
     async def disconnect(self) -> None:
         if self.client is not None:
@@ -244,7 +278,8 @@ class ChatSession:
         self.peers[LEAD_KEY] = AgentPeer(
             role_key=LEAD_KEY,
             system_prompt=LEAD_GROUPCHAT_PROMPT,
-            allowed_tools=[
+            tools=[],  # no Read/Write/Bash/web -- coordinates, doesn't execute
+            mcp_tool_names=[
                 "mcp__team-admin__add_teammate",
                 "mcp__team-admin__remove_teammate",
                 "mcp__team-admin__report_to_human",
@@ -290,7 +325,7 @@ class ChatSession:
             self.peers[role_key] = AgentPeer(
                 role_key=role_key,
                 system_prompt=_make_peer_prompt(role_key, args["description"], args["prompt"]),
-                allowed_tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
+                tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
             )
             return {"content": [{"type": "text", "text": f"Hired {args['display_name']} ({role_key}), live now."}]}
 
@@ -383,7 +418,15 @@ class ChatSession:
                     break  # lead had nothing and didn't close it either -- stop safely
 
         if self.wrap_up and self.final_summary:
-            await self.send(LEAD_KEY, self.final_summary)
+            # Backstop for the "lead already said this in the channel, now
+            # repeats it in report_to_human" case -- prompt asks it not to,
+            # but don't rely on that alone: skip an exact-duplicate resend.
+            last_lead_msg = next((t for r, t in reversed(transcript) if r == LEAD_KEY), None)
+            is_duplicate = last_lead_msg is not None and (
+                last_lead_msg.strip().lower() == self.final_summary.strip().lower()
+            )
+            if not is_duplicate:
+                await self.send(LEAD_KEY, self.final_summary)
         elif posted >= MAX_MESSAGES_PER_DISCUSSION:
             await self.send(LEAD_KEY, "(discussion hit the safety cap without wrapping up -- ask again to continue)")
 
