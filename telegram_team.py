@@ -1,25 +1,21 @@
 """
-Bridge: Telegram chat <-> claude-agent-sdk team (lead + on-demand teammates).
+Bridge: Telegram chat <-> claude-agent-sdk team, real peer-to-peer group chat.
 
-Every message is posted with a "Role: text" prefix so a single Telegram
-chat reads like a group chat between Lead and teammates. The lead can also
-hire/fire teammates at runtime via two in-process tools (add_teammate /
-remove_teammate) — the roster change takes effect on the next message, via
-a reconnect that resumes the same session so context isn't lost.
+Every teammate (including the lead) is its own independent, persistent
+ClaudeSDKClient -- not a one-shot Agent-tool delegation. All of them share
+one round-robin broadcast: a new message (from the human, or from any
+teammate) gets delivered to every other peer in turn; each peer either
+posts a real reply or PASSes if it has nothing to add. The lead is a peer
+too -- it can speak in the channel like anyone else -- but it alone holds
+report_to_human, the tool that actually closes out a discussion and sends
+the reply the human sees as "the answer". Free-for-all turn-taking, lead
+decides when to wrap up (both by explicit choice per a design discussion) --
+the one exception is an internal MAX_MESSAGES crash-guard (not a design
+opinion, just there so a stuck discussion can't loop forever on the API
+bill).
 
-Multi-user: each Telegram chat gets its own isolated ChatSession (own
-roster, own client/session_id) keyed by chat_id — one user's team, hires,
-and conversation history never leak into another's.
-
-Delivery model: a persistent background pump reads client.receive_messages()
-(the raw, never-terminating stream) for the whole life of the connection,
-instead of a fresh client.receive_response() per Telegram message (which
-stops at each turn's ResultMessage). Anything delivered after that boundary
-— a slow/async subagent completion — used to sit queued until the next
-message's query() resumed consumption, which looked exactly like the bot
-silently hanging. The pump also surfaces a subagent's own tool calls
-(Read/Grep/WebSearch/...) as short "thinking" one-liners while it works,
-instead of silence until the final answer.
+Multi-user: each Telegram chat gets its own isolated ChatSession keyed by
+chat_id -- own roster, own peers, own discussion state.
 
 Run: python telegram_team.py
 Then message your bot on Telegram.
@@ -28,6 +24,7 @@ Then message your bot on Telegram.
 import asyncio
 import os
 import re
+from typing import Awaitable, Callable
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -36,52 +33,78 @@ from telegram.error import BadRequest
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from claude_agent_sdk import (
-    AgentDefinition,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     AssistantMessage,
-    UserMessage,
     ResultMessage,
     TextBlock,
     ToolUseBlock,
-    ToolResultBlock,
     tool,
     create_sdk_mcp_server,
-    HookMatcher,
 )
 
-from team import LEAD_PROMPT, CHAT_STYLE, ONE_QUESTION_RULE
+from team import CHAT_STYLE
 
 load_dotenv()
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-DELEGATE_TOOL = "Agent"  # this SDK build's Task-delegation tool is named "Agent"
 DEFAULT_EMOJI = "🤖"
+LEAD_KEY = "lead"
 
-ROSTER_PROMPT_ADDENDUM = (
-    " You start every new session with ZERO teammates hired — no researcher, "
-    "coder, reviewer, or anyone else exists until you hire them. This is a "
-    "hard rule, not a suggestion: you never answer a task yourself and you "
-    "never delegate to a generic/default agent type. For every task, first "
-    "check whether an already-hired teammate fits; if not, your very first "
-    "tool call this turn MUST be add_teammate for whatever specialist the "
-    "task needs, before anything else — including before saying anything "
-    "else to the user. Only after that hire lands (next message) do you "
-    "delegate to it. Reuse the standard researcher/coder/reviewer trio (with "
-    "the duties described above) for coding-shaped tasks, or hire something "
-    "more specific if that fits better (e.g. an advisor for a life/finance "
-    "decision, a data-analyst for a spreadsheet question) — pick whatever "
-    "specialist actually matches the task, don't force it into "
-    "researcher/coder/reviewer if it doesn't fit. "
-    "Reuse a teammate you've already hired for follow-up tasks instead of "
-    "hiring a duplicate. Call add_teammate with a short role_key (lowercase, "
-    "no spaces), a display_name, one emoji, a description, and a system "
-    "prompt for that role. If asked to remove/fire a teammate, call "
-    "remove_teammate with its role_key. Both take effect starting the next "
-    "message, not this one — tell the user that, and don't try to delegate "
-    "to a role in the same turn you just hired it."
+# Internal crash-guard only -- the design choice was free-for-all turn-taking
+# with the lead deciding when to close a discussion, no fixed round cap. This
+# is just a floor so a discussion that never converges can't loop forever.
+MAX_MESSAGES_PER_DISCUSSION = 40
+
+# Every peer (lead included) gets this: how to behave in a shared channel
+# instead of a private one-shot answer.
+GROUPCHAT_RULES = (
+    "You're in a live group chat with your manager and teammates, working "
+    "together for a human user. You'll be shown the message(s) posted since "
+    "you last spoke. If you have something useful to add -- your own "
+    "expertise, a finding, a question, pushback on someone else -- post a "
+    "short chat message. If you genuinely have nothing to add right now, "
+    "reply with EXACTLY the single word PASS and nothing else, no "
+    "punctuation, no explanation. Only speak when it adds real value -- "
+    "don't acknowledge, restate what was just said, or say 'sounds good' "
+    "for the sake of it. " + CHAT_STYLE
 )
+
+LEAD_GROUPCHAT_PROMPT = (
+    "You are the Lead, manager of this team. You participate in the group "
+    "chat like everyone else (or PASS) -- you are not just a router, you "
+    "have your own judgment and can weigh in, push back, or ask questions "
+    "same as any teammate. But you are also the only one who can close a "
+    "discussion out: when you decide the team has covered what's needed, "
+    "call report_to_human with a short summary -- that is the ONLY thing "
+    "the human actually reads as 'the answer'; everything else in the "
+    "channel is your team's live working discussion, visible to them but "
+    "not addressed to them directly. "
+    "\n\n"
+    "You start every session with ZERO teammates hired -- hire whoever a "
+    "task actually needs via add_teammate before or during discussion (not "
+    "as a blocking gate -- you can hire mid-discussion the moment you "
+    "realize a specialist is needed). Reuse a teammate you've already hired "
+    "for follow-up topics instead of hiring a duplicate. Fire one with "
+    "remove_teammate if it's no longer relevant. You do not have Read, "
+    "Write, Bash, or web tools yourself -- if actual work is needed "
+    "(research, code, review, anything hands-on), that's what teammates are "
+    "for; you coordinate, they execute. "
+    "\n\n"
+    "If every teammate PASSes a full round and you're asked to decide: you "
+    "may NOT also PASS at that point -- you must either call "
+    "report_to_human to close it out, or post what happens next (e.g. hire "
+    "someone, ask the human a question, redirect the discussion). Never "
+    "leave a round-robin dangling. " + GROUPCHAT_RULES
+)
+
+
+def _make_peer_prompt(role_key: str, description: str, base_prompt: str) -> str:
+    return (
+        f"{base_prompt} Your role in the channel is {role_key}: {description}. "
+        + GROUPCHAT_RULES
+    )
 
 
 def _to_telegram_markdown(text: str) -> str:
@@ -117,32 +140,10 @@ def _chunk(text: str, size: int = CHUNK_SIZE) -> list[str]:
     return chunks
 
 
-# Housekeeping text the Agent tool emits, never meant for a user-facing reply
-# (normally suppressed by LEAD_PROMPT forbidding run_in_background; filtered
-# here too as a defensive fallback in case a background dispatch slips through).
-_INTERNAL_MARKERS = ("agentid:", "async agent launched", "output_file:")
-
-
-def _extract_result_text(content) -> str:
-    """A subagent's Agent-tool result is a list of text blocks: its real
-    reply, plus internal housekeeping blocks we don't want surfaced in chat."""
-    if isinstance(content, str):
-        content = [{"text": content}]
-    parts = []
-    for block in content or []:
-        text = block.get("text", "") if isinstance(block, dict) else str(block)
-        if any(marker in text.lower() for marker in _INTERNAL_MARKERS):
-            continue
-        parts.append(text)
-    text = "\n".join(p for p in parts if p.strip())
-    return text or "(picked up the task, working on it)"
-
-
 def _describe_tool_use(block: ToolUseBlock) -> str | None:
-    """Turn a subagent's own tool call into a short 'what I'm doing right
-    now' line, so the chat shows activity while it works instead of long
-    silence before one big final answer. Returns None for tools not worth
-    narrating (skips them quietly)."""
+    """Turn a peer's own tool call into a short 'what I'm doing right now'
+    line, so the chat shows activity while it works instead of long silence
+    before a final reply. Returns None for tools not worth narrating."""
     inp = block.input or {}
     if block.name == "Read":
         return f"(reading `{inp.get('file_path', '?')}`)"
@@ -164,272 +165,234 @@ def _describe_tool_use(block: ToolUseBlock) -> str | None:
     return None
 
 
-class ChatSession:
-    """Everything scoped to one Telegram chat: its own roster, emoji/name
-    tags, live client + session_id, and the hire/fire tools + PreToolUse
-    hook bound to *this* session's state (closures, not module globals) so
-    two chats never see or affect each other's team.
+class AgentPeer:
+    """One independent, persistent teammate. Its own ClaudeSDKClient, its
+    own memory across the whole chat (never reconnected), no delegation
+    machinery -- just a participant in the shared channel."""
 
-    Delivery runs on a persistent background pump (`_pump`) reading
-    `receive_messages()` for the connection's whole lifetime, rather than a
-    fresh `receive_response()` per incoming Telegram message — see module
-    docstring for why that boundary was the actual bug."""
+    def __init__(self, role_key: str, system_prompt: str, allowed_tools: list[str],
+                 mcp_servers: dict | None = None):
+        self.role_key = role_key
+        self.system_prompt = system_prompt
+        self.allowed_tools = allowed_tools
+        self.mcp_servers = mcp_servers or {}
+        self.client: ClaudeSDKClient | None = None
+
+    async def _ensure(self) -> ClaudeSDKClient:
+        if self.client is None:
+            options = ClaudeAgentOptions(
+                system_prompt=self.system_prompt,
+                allowed_tools=self.allowed_tools,
+                mcp_servers=self.mcp_servers,
+                permission_mode="bypassPermissions",
+                cwd=PROJECT_DIR,
+            )
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            self.client = client
+        return self.client
+
+    async def say(self, incoming: str, on_note: Callable[[str], Awaitable[None]] | None = None) -> str | None:
+        """One turn: deliver `incoming`, return the reply text, or None if
+        the peer PASSed. Streams interim tool-use activity via on_note."""
+        client = await self._ensure()
+        await client.query(incoming)
+        parts = []
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        parts.append(block.text)
+                    elif isinstance(block, ToolUseBlock) and on_note is not None:
+                        note = _describe_tool_use(block)
+                        if note:
+                            await on_note(note)
+            elif isinstance(message, ResultMessage):
+                pass
+        text = "\n".join(p for p in parts if p.strip()).strip()
+        if not text or text.strip().upper() == "PASS":
+            return None
+        return text
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.disconnect()
+            self.client = None
+
+
+class ChatSession:
+    """Everything scoped to one Telegram chat: the live roster of peers
+    (lead always present), emoji/name tags, and the round-robin discussion
+    engine."""
 
     def __init__(self, chat_id: int) -> None:
         self.chat_id = chat_id
         self.bot = None  # set on first message (python-telegram-bot's Bot instance)
 
-        # Roster starts empty — lead hires whatever a task actually needs.
-        self.team: dict[str, AgentDefinition] = {}
-        self.role_name: dict[str, str] = {}
-        # Telegram has no per-message text-color API for bots -> emoji is
-        # the closest real substitute for "color-coding" each speaker.
-        self.role_emoji: dict[str, str] = {"Lead": "🧑‍💼"}
+        self.role_name: dict[str, str] = {LEAD_KEY: "Lead"}
+        self.role_desc: dict[str, str] = {LEAD_KEY: "Manager -- coordinates, decides, reports back."}
+        self.role_emoji: dict[str, str] = {LEAD_KEY: "🧑‍💼"}
+        self.peers: dict[str, AgentPeer] = {}
 
-        self.client: ClaudeSDKClient | None = None
-        self.session_id: str | None = None
-        self.pending_reconnect = False
-        self.freshly_hired: set[str] = set()  # hired this turn, not yet live in the CLI session
-        self.pending: dict[str, str] = {}  # tool_use_id -> role, for delegations awaiting a result
-        self.lock = asyncio.Lock()  # guards client/pump setup, teardown, and query() calls
-        self.pump_task: asyncio.Task | None = None
+        # discussion state, reset per human message
+        self.wrap_up = False
+        self.final_summary: str | None = None
 
         self.admin_server = create_sdk_mcp_server(
             name="team-admin", version="1.0.0", tools=self._make_admin_tools()
         )
+        self.peers[LEAD_KEY] = AgentPeer(
+            role_key=LEAD_KEY,
+            system_prompt=LEAD_GROUPCHAT_PROMPT,
+            allowed_tools=[
+                "mcp__team-admin__add_teammate",
+                "mcp__team-admin__remove_teammate",
+                "mcp__team-admin__report_to_human",
+            ],
+            mcp_servers={"team-admin": self.admin_server},
+        )
 
-    def tag(self, role: str) -> str:
-        return f"{self.role_emoji.get(role, DEFAULT_EMOJI)} {role}"
+    def tag(self, role_key: str) -> str:
+        name = self.role_name.get(role_key, role_key.capitalize())
+        emoji = self.role_emoji.get(role_key, DEFAULT_EMOJI)
+        return f"{emoji} {name}"
 
-    async def send(self, role: str, text: str) -> None:
+    async def send(self, role_key: str, text: str) -> None:
         text = text.strip()
         if not text or self.bot is None:
             return
-        prefix = self.tag(role)
+        prefix = self.tag(role_key)
         for i, part in enumerate(_chunk(text)):
             await self.bot.send_chat_action(chat_id=self.chat_id, action="typing")
             await asyncio.sleep(0.3)
-            head = f"*{prefix}:* " if i == 0 else ""  # continuation chunks skip the name
+            head = f"*{prefix}:* " if i == 0 else ""
             body = f"{head}{_to_telegram_markdown(part)}"
             try:
                 await self.bot.send_message(chat_id=self.chat_id, text=body, parse_mode=ParseMode.MARKDOWN)
             except BadRequest:
-                # Unbalanced markdown entity (e.g. a stray "*" in code) -> send raw, never drop the message.
                 raw_head = f"{prefix}: " if i == 0 else ""
                 await self.bot.send_message(chat_id=self.chat_id, text=f"{raw_head}{part}")
 
-    # --- hire / fire tools, run in-process, bound to this session's roster ---
+    # --- hire / fire / report_to_human, run in-process, bound to this session ---
 
     def _make_admin_tools(self) -> list:
         @tool(
             "add_teammate",
-            "Hire a new teammate role the user asked for (e.g. a documentation writer). "
-            "Takes effect starting the next message — say so in your reply.",
+            "Hire a new peer into the group chat (e.g. a travel planner, a "
+            "finance advisor). Live immediately -- can be addressed the same turn.",
             {"role_key": str, "display_name": str, "emoji": str, "description": str, "prompt": str},
         )
         async def add_teammate(args: dict) -> dict:
             role_key = args["role_key"].strip().lower()
-            self.team[role_key] = AgentDefinition(
-                description=args["description"],
-                # every hire gets the same chat-length + ask-one-question rules as the built-in roles
-                prompt=args["prompt"] + " " + CHAT_STYLE + " " + ONE_QUESTION_RULE,
-                tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
-                model="sonnet",
-                # AgentDefinition doesn't inherit the lead's permission_mode --
-                # without this, WebSearch/WebFetch get silently permission-denied
-                # (no interactive approver here) and the hire just claims it
-                # "doesn't have web access" instead of actually trying.
-                permissionMode="bypassPermissions",
-            )
             self.role_name[role_key] = args["display_name"]
-            self.role_emoji[args["display_name"]] = args.get("emoji") or DEFAULT_EMOJI
-            self.pending_reconnect = True
-            self.freshly_hired.add(role_key)
-            return {"content": [{"type": "text", "text": f"Hired {args['display_name']} ({role_key})."}]}
+            self.role_desc[role_key] = args["description"]
+            self.role_emoji[role_key] = args.get("emoji") or DEFAULT_EMOJI
+            self.peers[role_key] = AgentPeer(
+                role_key=role_key,
+                system_prompt=_make_peer_prompt(role_key, args["description"], args["prompt"]),
+                allowed_tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
+            )
+            return {"content": [{"type": "text", "text": f"Hired {args['display_name']} ({role_key}), live now."}]}
 
         @tool(
             "remove_teammate",
-            "Fire a teammate role the user asked to remove. Takes effect starting the "
-            "next message — say so in your reply.",
+            "Fire a peer from the group chat. Cannot remove 'lead'.",
             {"role_key": str},
         )
         async def remove_teammate(args: dict) -> dict:
             role_key = args["role_key"].strip().lower()
-            if role_key not in self.team:
+            if role_key == LEAD_KEY:
+                return {"content": [{"type": "text", "text": "Can't fire the lead."}], "is_error": True}
+            peer = self.peers.pop(role_key, None)
+            if peer is None:
                 return {"content": [{"type": "text", "text": f"No such teammate: {role_key}"}], "is_error": True}
+            await peer.disconnect()
             display = self.role_name.pop(role_key, role_key.capitalize())
-            self.role_emoji.pop(display, None)
-            del self.team[role_key]
-            self.pending_reconnect = True
+            self.role_desc.pop(role_key, None)
+            self.role_emoji.pop(role_key, None)
             return {"content": [{"type": "text", "text": f"Fired {display} ({role_key})."}]}
 
-        return [add_teammate, remove_teammate]
-
-    async def _guard_delegation(self, hook_input, tool_use_id, context):
-        """PreToolUse hook on the Agent tool — enforces two things the
-        prompt only asks nicely for, because both failure modes look like
-        "the bot hung" from the Telegram side:
-
-        1. Never background a delegation. If it's ignored, the real result
-           only shows up once something later drains the raw stream again
-           — the pump now does this continuously, but there's no reason to
-           rely on that when the tool call can just be forced synchronous.
-        2. Never delegate to a role hired earlier this same turn — the CLI
-           session's agent list is a snapshot from connect() time, so a
-           same-turn hire isn't live yet. Without this, the model was
-           observed retrying the same failing delegation ~7 times before
-           giving up, burning a full round-trip each time.
-        """
-        tool_input = hook_input.get("tool_input", {})
-
-        subagent_type = tool_input.get("subagent_type")
-        if subagent_type in self.freshly_hired:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        f"'{subagent_type}' was just hired this turn and isn't live yet "
-                        "(takes effect next message). Stop retrying — tell the user "
-                        "you're waiting on them to send another message, then stop."
-                    ),
-                }
-            }
-
-        if tool_input.get("run_in_background"):
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "updatedInput": {**tool_input, "run_in_background": False},
-                }
-            }
-        return {}
-
-    def _build_options(self) -> ClaudeAgentOptions:
-        return ClaudeAgentOptions(
-            system_prompt=LEAD_PROMPT + ROSTER_PROMPT_ADDENDUM,
-            agents=self.team,
-            mcp_servers={"team-admin": self.admin_server},
-            allowed_tools=[
-                DELEGATE_TOOL,
-                "mcp__team-admin__add_teammate",
-                "mcp__team-admin__remove_teammate",
-            ],
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(matcher=DELEGATE_TOOL, hooks=[self._guard_delegation])
-                ]
-            },
-            # "acceptEdits" only auto-approves file-edit tools -- WebSearch/
-            # WebFetch/Bash/etc still hit an unanswerable permission prompt
-            # (no interactive approver exists here) and get silently denied.
-            # This is a trusted single-operator POC, so bypass outright.
-            permission_mode="bypassPermissions",
-            cwd=PROJECT_DIR,
-            resume=self.session_id,
+        @tool(
+            "report_to_human",
+            "Close out this discussion and send the human your summary -- the "
+            "only thing they actually read as 'the answer'. Call this when the "
+            "team has covered what's needed.",
+            {"summary": str},
         )
+        async def report_to_human(args: dict) -> dict:
+            self.wrap_up = True
+            self.final_summary = args["summary"]
+            return {"content": [{"type": "text", "text": "Reported to human, discussion closing."}]}
 
-    # --- connection + persistent pump lifecycle -------------------------
+        return [add_teammate, remove_teammate, report_to_human]
 
-    async def ensure_ready(self) -> ClaudeSDKClient:
-        """Connect (or reconnect after a roster change) and make sure the
-        background pump is running, all under one lock so a query() call
-        never races a reconnect swapping the client out from under it."""
-        async with self.lock:
-            if self.client is None:
-                client = ClaudeSDKClient(options=self._build_options())
-                await client.connect()
-                self.client = client
-                self.pump_task = asyncio.create_task(self._pump())
-            return self.client
+    # --- round-robin discussion engine -----------------------------------
 
-    async def _reconnect_locked(self) -> None:
-        """Drop and rebuild the client (new roster), resuming the same
-        session. Must run under self.lock (called from the pump itself via
-        a detached task, since the pump can't cancel/await its own task)."""
-        async with self.lock:
-            old_client, old_pump = self.client, self.pump_task
-            self.client, self.pump_task = None, None
-            if old_pump is not None:
-                old_pump.cancel()
-            if old_client is not None:
-                await old_client.disconnect()
-            client = ClaudeSDKClient(options=self._build_options())
-            await client.connect()
-            self.client = client
-            self.pump_task = asyncio.create_task(self._pump())
-            self.freshly_hired.clear()  # this reconnect is exactly what makes them live
+    async def handle_human_message(self, text: str) -> None:
+        self.wrap_up = False
+        self.final_summary = None
+        transcript: list[tuple[str, str]] = [("human", f"(from the human) {text}")]
+        last_seen: dict[str, int] = {}
+        posted = 0
+
+        def delta_for(role_key: str) -> str:
+            seen = last_seen.get(role_key, 0)
+            new = transcript[seen:]
+            last_seen[role_key] = len(transcript)
+            return "\n".join(f"{self.tag(r)}: {t}" for r, t in new)
+
+        while posted < MAX_MESSAGES_PER_DISCUSSION and not self.wrap_up:
+            round_had_speech = False
+            for role_key in list(self.peers.keys()):
+                if posted >= MAX_MESSAGES_PER_DISCUSSION or self.wrap_up:
+                    break
+                delta = delta_for(role_key)
+                if not delta.strip():
+                    continue
+                peer = self.peers.get(role_key)
+                if peer is None:
+                    continue
+                reply = await peer.say(delta, on_note=lambda note, rk=role_key: self.send(rk, note))
+                if self.wrap_up:
+                    break
+                if reply:
+                    transcript.append((role_key, reply))
+                    posted += 1
+                    round_had_speech = True
+                    await self.send(role_key, reply)
+
+            if self.wrap_up:
+                break
+
+            if not round_had_speech:
+                # Everyone passed -- force the lead to explicitly decide
+                # instead of looping silently (its own prompt forbids
+                # PASSing here, so this is the guaranteed termination path
+                # short of the crash-guard).
+                lead = self.peers.get(LEAD_KEY)
+                delta = delta_for(LEAD_KEY) or "(no new messages)"
+                nudge = delta + "\n\n(No one has anything to add. Decide now: call report_to_human, or say what happens next.)"
+                reply = await lead.say(nudge, on_note=lambda note: self.send(LEAD_KEY, note)) if lead else None
+                if self.wrap_up:
+                    break
+                if reply:
+                    transcript.append((LEAD_KEY, reply))
+                    posted += 1
+                    await self.send(LEAD_KEY, reply)
+                else:
+                    break  # lead had nothing and didn't close it either -- stop safely
+
+        if self.wrap_up and self.final_summary:
+            await self.send(LEAD_KEY, self.final_summary)
+        elif posted >= MAX_MESSAGES_PER_DISCUSSION:
+            await self.send(LEAD_KEY, "(discussion hit the safety cap without wrapping up -- ask again to continue)")
 
     async def disconnect(self) -> None:
-        async with self.lock:
-            if self.pump_task is not None:
-                self.pump_task.cancel()
-                self.pump_task = None
-            if self.client is not None:
-                await self.client.disconnect()
-                self.client = None
-
-    async def query(self, task: str) -> None:
-        await self.ensure_ready()
-        async with self.lock:
-            if self.client is not None:
-                await self.client.query(task)
-
-    async def _pump(self) -> None:
-        """Runs for the whole life of the connection, independent of any
-        single Telegram message's turn boundary — this is what actually
-        fixes the "reply only shows up after I send another message" bug:
-        receive_response() stops at each ResultMessage, so anything
-        delivered after that point just sat queued until the next query()
-        resumed consumption. receive_messages() never stops on its own."""
-        try:
-            async for message in self.client.receive_messages():
-                try:
-                    await self._handle_message(message)
-                except Exception as exc:
-                    await self.send("Lead", f"(error handling an update) {exc}")
-        except asyncio.CancelledError:
-            pass
-
-    async def _handle_message(self, message) -> None:
-        if isinstance(message, AssistantMessage):
-            if message.parent_tool_use_id is None:
-                # the lead's own turn
-                self.session_id = message.session_id or self.session_id
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        await self.send("Lead", block.text)
-                    elif isinstance(block, ToolUseBlock) and block.name == DELEGATE_TOOL:
-                        role = self.role_name.get(block.input.get("subagent_type", ""), "Agent")
-                        desc = block.input.get("description", "a subtask")
-                        self.pending[block.id] = role
-                        await self.send("Lead", f"(delegating to {role}) {desc}")
-            else:
-                # a subagent's own activity, mid-delegation -> a "thinking" one-liner
-                role = self.pending.get(message.parent_tool_use_id)
-                if role:
-                    for block in message.content:
-                        if isinstance(block, ToolUseBlock):
-                            note = _describe_tool_use(block)
-                            if note:
-                                await self.send(role, note)
-
-        elif isinstance(message, UserMessage) and isinstance(message.content, list):
-            if message.parent_tool_use_id is None:
-                for block in message.content:
-                    if isinstance(block, ToolResultBlock) and block.tool_use_id in self.pending:
-                        role = self.pending.pop(block.tool_use_id)
-                        await self.send(role, _extract_result_text(block.content))
-
-        elif isinstance(message, ResultMessage):
-            self.session_id = message.session_id or self.session_id
-            if self.pending_reconnect:
-                self.pending_reconnect = False
-                asyncio.create_task(self._reconnect_locked())
+        for peer in self.peers.values():
+            await peer.disconnect()
 
 
-# One ChatSession per Telegram chat_id — fully isolated rosters/sessions.
+# One ChatSession per Telegram chat_id -- fully isolated rosters/discussions.
 _sessions: dict[int, ChatSession] = {}
 
 
@@ -444,17 +407,19 @@ def get_session(chat_id: int) -> tuple[ChatSession, bool]:
 
 
 def _roster_message(session: ChatSession) -> str:
-    lines = [f"*{session.tag('Lead')}:* hey, I'm your lead for this chat.", ""]
-    lines.append(f"*{session.tag('Lead')}* — breaks down your task, hires + delegates, synthesizes the final answer.")
-    if session.team:
+    lines = [f"*{session.tag('lead')}:* hey, I'm your lead for this chat.", ""]
+    lines.append(f"*{session.tag('lead')}* — {session.role_desc['lead']}")
+    others = [k for k in session.peers if k != LEAD_KEY]
+    if others:
         lines.append("")
         lines.append("Current team:")
-        for role_key, agent in session.team.items():
-            lines.append(f"*{session.tag(session.role_name[role_key])}* — {agent.description}")
+        for role_key in others:
+            lines.append(f"*{session.tag(role_key)}* — {session.role_desc.get(role_key, '')}")
     else:
         lines.append("No teammates hired yet — I'll hire whoever a task needs as it comes in.")
     lines.append("")
-    lines.append("Send me a task to start, or say \"add/fire a <role>\" to shape the team yourself.")
+    lines.append("Send me a task to start. Everyone chats live in here -- you'll see the team")
+    lines.append("talk it out; my summary is the actual answer.")
     return "\n".join(lines)
 
 
@@ -472,9 +437,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await context.bot.send_message(chat_id=chat_id, text=_roster_message(session))
 
     try:
-        await session.query(update.message.text)
+        await session.handle_human_message(update.message.text)
     except Exception as exc:  # surface errors into the chat instead of dying silently
-        await context.bot.send_message(chat_id=chat_id, text=f"*{session.tag('Lead')}:* (error) {exc}",
+        await context.bot.send_message(chat_id=chat_id, text=f"*{session.tag('lead')}:* (error) {exc}",
                                         parse_mode=ParseMode.MARKDOWN)
 
 
