@@ -144,6 +144,54 @@ construction: there's no delegation to background, no "hired but not live
 yet" window, and no built-in generic agent to fall back to instead of a
 real teammate.
 
+## Multi-device: `backend_server.py` + project auto-discovery
+
+`telegram_team.py` stays the only thing that talks to Telegram (the
+"orchestrator") — it still owns every `ChatSession`, the round-robin
+transcript, and turn-taking, exactly as above. What's new is where a peer's
+turn actually *executes*:
+
+- **`peers.py`** holds `AgentPeer` (today's local `ClaudeSDKClient` peer,
+  unchanged) and `RemotePeer` — same `say(incoming, on_note)` interface, but
+  it calls another device's `backend_server.py` over HTTP/SSE instead. From
+  the round-robin loop's point of view the two are interchangeable; a remote
+  peer is just another entry in `ChatSession.peers`.
+- **`backend_server.py`** runs on a remote device (a second laptop, a phone
+  via Termux). It hosts whichever `AgentPeer`s are assigned to that device
+  and exposes `GET /health` / `POST /peer/{role_key}/message` (SSE) for the
+  orchestrator to call. Auth is a shared-secret header
+  (`TEAM_SHARED_SECRET` env var on both sides) — plain LAN transport, no
+  Tailscale/tunnel needed unless a device leaves the home network.
+- **An unreachable remote peer is treated as a PASS for that turn** — the
+  discussion just continues rather than hanging on one offline device.
+  Verified live: killing the backend process mid-test made `RemotePeer.say()`
+  return `None` cleanly instead of blocking.
+
+### Project auto-discovery
+
+- **`discovery.py`**: `discover_projects(root)` walks one level under a
+  projects directory, reads `project.json` out of any subfolder that has
+  one, and returns a manifest per project — folders without a manifest are
+  silently skipped. `load_devices(path)` reads `devices.json` (see
+  `devices.json.example`) for the device address table and which device
+  each project key is assigned to.
+- **`projects/<key>/project.json`** is the standard structure — see
+  `projects/README.md` for the schema. Deliberately device-agnostic: the
+  same manifest file is meant to reach every device identically (e.g. via
+  Syncthing mirroring the whole `projects/` root), so device ownership lives
+  in the separate `devices.json` instead, not inside a file that's identical
+  everywhere.
+- **Rescanned before every discussion, not just at startup** —
+  `ChatSession._rescan_projects()` runs at the top of
+  `handle_human_message()`. Drop a new project folder in, message the bot,
+  and it's usable in that same conversation — no restart. A freshly
+  discovered project peer gets the same "can't be closed out before its
+  debut turn" guard (`newly_hired`) that a manual hire already gets.
+- Distributing the actual project folders to every device is a deployment
+  concern, not code: point Syncthing (or `git pull`) at the shared
+  `projects/` root so laptop2 and both phones end up with the same tree at
+  the same relative path.
+
 ## Next steps to explore
 
 - Give non-lead peers their own light admin power (e.g. hiring a specialist
@@ -152,3 +200,8 @@ real teammate.
   currently in-memory only, lost on process restart.
 - Tune `MAX_MESSAGES_PER_DISCUSSION` based on real usage once cost patterns
   are visible.
+- Harden a Termux-based phone backend: `termux-wake-lock`, the Termux:Boot
+  addon, and a battery-optimization exemption — Android will otherwise kill
+  a background `backend_server.py` process (see the plan doc for detail).
+  Bring up laptop2 as a remote backend first; phones are the least reliable
+  device and should be last.

@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to devices.json (gitignored -- this is per-install config, not shared/synced with the projects themselves). 'devices' maps a device id to its backend_server.py LAN address, or null for 'local' (runs in the orchestrator's own process). 'assignments' maps a project's manifest 'key' to one of those device ids; omit a project here and it defaults to local.",
+  "devices": {
+    "local": null,
+    "laptop2": "http://laptop2.local:8800",
+    "phone1": "http://phone1.local:8800",
+    "phone2": "http://phone2.local:8800"
+  },
+  "assignments": {
+    "finance": "local",
+    "recipes": "laptop2"
+  }
+}

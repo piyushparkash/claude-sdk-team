@@ -3,5 +3,9 @@ __pycache__/
 .venv/
 .env
 telegram_bot.log
+backend.log
+devices.json
+projects/*/
+!projects/README.md
 .claude/
 sql-parser-ui/

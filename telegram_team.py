@@ -24,7 +24,6 @@ Then message your bot on Telegram.
 import asyncio
 import os
 import re
-from typing import Awaitable, Callable
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -32,23 +31,19 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    AssistantMessage,
-    ResultMessage,
-    TextBlock,
-    ToolUseBlock,
-    tool,
-    create_sdk_mcp_server,
-)
+from claude_agent_sdk import tool, create_sdk_mcp_server
 
 from team import CHAT_STYLE, ONE_QUESTION_RULE
+from discovery import discover_projects, load_devices
+from peers import AgentPeer, RemotePeer
 
 load_dotenv()
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.join(PROJECT_DIR, "projects"))
+DEVICES_PATH = os.environ.get("DEVICES_PATH", os.path.join(PROJECT_DIR, "devices.json"))
+SHARED_SECRET = os.environ.get("TEAM_SHARED_SECRET")
 DEFAULT_EMOJI = "🤖"
 LEAD_KEY = "lead"
 
@@ -197,100 +192,6 @@ def _split_into_bursts(text: str) -> list[str]:
     return bursts or [text]
 
 
-def _describe_tool_use(block: ToolUseBlock) -> str | None:
-    """Turn a peer's own tool call into a short 'what I'm doing right now'
-    line, so the chat shows activity while it works instead of long silence
-    before a final reply. Returns None for tools not worth narrating."""
-    inp = block.input or {}
-    if block.name == "Read":
-        return f"(reading `{inp.get('file_path', '?')}`)"
-    if block.name == "Write":
-        return f"(writing `{inp.get('file_path', '?')}`)"
-    if block.name == "Edit":
-        return f"(editing `{inp.get('file_path', '?')}`)"
-    if block.name == "Grep":
-        return f"(searching code for '{inp.get('pattern', '?')}')"
-    if block.name == "Glob":
-        return f"(listing files matching '{inp.get('pattern', '?')}')"
-    if block.name == "WebSearch":
-        return f"(searching the web: '{inp.get('query', '?')}')"
-    if block.name == "WebFetch":
-        return f"(reading {inp.get('url', '?')})"
-    if block.name == "Bash":
-        cmd = (inp.get("command") or "?").strip()
-        return f"(running: `{cmd[:60]}{'…' if len(cmd) > 60 else ''}`)"
-    return None
-
-
-class AgentPeer:
-    """One independent, persistent teammate. Its own ClaudeSDKClient, its
-    own memory across the whole chat (never reconnected), no delegation
-    machinery -- just a participant in the shared channel."""
-
-    def __init__(self, role_key: str, system_prompt: str, tools: list[str],
-                 mcp_servers: dict | None = None, mcp_tool_names: list[str] | None = None):
-        self.role_key = role_key
-        self.system_prompt = system_prompt
-        # `tools` is a HARD restriction on which built-in tools exist at all
-        # (ClaudeAgentOptions.tools) -- `allowed_tools` (below) only controls
-        # permission *prompting* and is a no-op once bypassPermissions is
-        # set, so it alone doesn't stop a peer from using tools outside its
-        # role. Confirmed live: lead (meant to have zero tools) used Read
-        # directly and wrote+reviewed code itself, no hire, no cross-talk,
-        # because `tools=` wasn't being set and bypassPermissions made the
-        # allowed_tools restriction meaningless.
-        self.tools = tools
-        self.mcp_servers = mcp_servers or {}
-        self.mcp_tool_names = mcp_tool_names or []
-        self.client: ClaudeSDKClient | None = None
-
-    async def _ensure(self) -> ClaudeSDKClient:
-        if self.client is None:
-            options = ClaudeAgentOptions(
-                system_prompt=self.system_prompt,
-                tools=self.tools,
-                allowed_tools=self.tools + self.mcp_tool_names,
-                mcp_servers=self.mcp_servers,
-                permission_mode="bypassPermissions",
-                cwd=PROJECT_DIR,
-            )
-            client = ClaudeSDKClient(options=options)
-            await client.connect()
-            self.client = client
-        return self.client
-
-    async def say(self, incoming: str, on_note: Callable[[str], Awaitable[None]] | None = None) -> str | None:
-        """One turn: deliver `incoming`, return the reply text, or None if
-        the peer PASSed. Streams interim tool-use activity via on_note."""
-        client = await self._ensure()
-        await client.query(incoming)
-        parts = []
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        parts.append(block.text)
-                    elif isinstance(block, ToolUseBlock) and on_note is not None:
-                        note = _describe_tool_use(block)
-                        if note:
-                            await on_note(note)
-            elif isinstance(message, ResultMessage):
-                pass
-        text = "\n".join(p for p in parts if p.strip()).strip()
-        if not text or text.upper() == "PASS":
-            return None
-        # Defensive cleanup: prompt says PASS must be standalone, but if a
-        # peer tacks a trailing "PASS" line onto real content anyway, strip
-        # it rather than leaking the literal word into the chat.
-        text = re.sub(r"\n+PASS\s*$", "", text, flags=re.IGNORECASE).strip()
-        return text or None
-
-    async def disconnect(self) -> None:
-        if self.client is not None:
-            await self.client.disconnect()
-            self.client = None
-
-
 class ChatSession:
     """Everything scoped to one Telegram chat: the live roster of peers
     (lead always present), emoji/name tags, and the round-robin discussion
@@ -314,6 +215,10 @@ class ChatSession:
         # the same turn as a hire, but that wasn't reliably followed, so
         # this is enforced structurally instead of hoped for.
         self.newly_hired: set[str] = set()
+        # role_keys that came from project auto-discovery, not a manual hire
+        # -- lets the rescan drop a peer whose project folder disappeared
+        # without ever touching lead or a manually hired teammate.
+        self.discovered_keys: set[str] = set()
 
         self.admin_server = create_sdk_mcp_server(
             name="team-admin", version="1.0.0", tools=self._make_admin_tools()
@@ -322,6 +227,7 @@ class ChatSession:
             role_key=LEAD_KEY,
             system_prompt=LEAD_GROUPCHAT_PROMPT,
             tools=[],  # no Read/Write/Bash/web -- coordinates, doesn't execute
+            cwd=PROJECT_DIR,
             mcp_tool_names=[
                 "mcp__team-admin__add_teammate",
                 "mcp__team-admin__remove_teammate",
@@ -373,6 +279,7 @@ class ChatSession:
                 role_key=role_key,
                 system_prompt=_make_peer_prompt(role_key, args["description"], args["prompt"]),
                 tools=["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
+                cwd=PROJECT_DIR,
             )
             self.newly_hired.add(role_key)
             return {"content": [{"type": "text", "text": f"Hired {args['display_name']} ({role_key}), live now."}]}
@@ -409,12 +316,56 @@ class ChatSession:
 
         return [add_teammate, remove_teammate, report_to_human]
 
+    # --- project auto-discovery --------------------------------------------
+
+    async def _rescan_projects(self) -> None:
+        """Pick up new project folders (and drop ones that disappeared)
+        before every discussion -- a new project.json becomes usable on the
+        very next message, no restart needed. Never touches lead or a
+        manually hired teammate, only role_keys this method itself added."""
+        manifests = discover_projects(PROJECTS_DIR)
+        devices, assignments = load_devices(DEVICES_PATH)
+
+        for key, manifest in manifests.items():
+            if key in self.peers:
+                continue  # already live -- don't reconnect mid-conversation
+            device = assignments.get(key, "local")
+            addr = devices.get(device)
+            self.role_name[key] = manifest.name
+            self.role_desc[key] = manifest.description
+            self.role_emoji[key] = manifest.emoji or DEFAULT_EMOJI
+            if addr:
+                self.peers[key] = RemotePeer(role_key=key, base_url=addr, shared_secret=SHARED_SECRET)
+            else:
+                self.peers[key] = AgentPeer(
+                    role_key=key,
+                    system_prompt=_make_peer_prompt(key, manifest.description, manifest.prompt),
+                    tools=manifest.tools,
+                    cwd=manifest.cwd,
+                )
+            self.discovered_keys.add(key)
+            # Same debut-turn guard as a manual hire -- don't let the lead
+            # close the discussion before a freshly discovered peer speaks.
+            self.newly_hired.add(key)
+
+        gone = self.discovered_keys - set(manifests)
+        for key in gone:
+            peer = self.peers.pop(key, None)
+            if peer is not None:
+                await peer.disconnect()
+            self.role_name.pop(key, None)
+            self.role_desc.pop(key, None)
+            self.role_emoji.pop(key, None)
+            self.discovered_keys.discard(key)
+            self.newly_hired.discard(key)
+
     # --- round-robin discussion engine -----------------------------------
 
     async def handle_human_message(self, text: str) -> None:
         self.wrap_up = False
         self.final_summary = None
         self.newly_hired.clear()
+        await self._rescan_projects()  # may repopulate newly_hired with fresh discoveries
         transcript: list[tuple[str, str]] = [("human", f"(from the human) {text}")]
         last_seen: dict[str, int] = {}
         posted = 0
@@ -532,6 +483,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session.bot = context.bot
 
     if created_now:
+        await session._rescan_projects()  # so the roster message lists discovered projects too
         try:
             await context.bot.send_message(
                 chat_id=chat_id, text=_roster_message(session), parse_mode=ParseMode.MARKDOWN
