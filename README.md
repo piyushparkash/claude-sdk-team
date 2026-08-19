@@ -192,6 +192,61 @@ turn actually *executes*:
   `projects/` root so laptop2 and both phones end up with the same tree at
   the same relative path.
 
+## Running a backend on an Android phone (Termux)
+
+Two real phones (a OnePlus on Android 15, a Samsung on Android 12) are live
+backends today. Getting there needed more than `pip install` — worth
+documenting since none of it is obvious going in:
+
+- **Rust-based deps have no Android wheel on PyPI.** `pydantic-core`,
+  `rpds-py`, `cryptography` all pip-build from source on Termux, needing
+  `pkg install rust` first and `ANDROID_API_LEVEL=<api>` set (35 for
+  Android 15, 31 for Android 12 — matches the device's own API level).
+  `pkg install python-cryptography` gets a prebuilt `cryptography` on some
+  setups; when its own postinstall still falls back to a pip source build,
+  it needs the same `ANDROID_API_LEVEL` + `RUSTFLAGS` treatment as below.
+- **Extensions built this way fail at import with `dlopen: cannot locate
+  symbol "PyExc_Warning"`.** Android's Bionic linker doesn't resolve a
+  shared library's undefined symbols against the main executable the way
+  Linux does, so a PyO3 extension needs to link `libpython` explicitly:
+  `RUSTFLAGS='-C link-arg=-lpython3.XX -C link-arg=-L<path to libpython.so
+  dir>'` on the `pip install --no-binary <pkg>` command. Get the exact
+  version pip resolves to from whatever's already installed (`pip show
+  pydantic` to find the `pydantic-core` version it actually wants) — an
+  unpinned rebuild can drift to a newer `pydantic-core` than the installed
+  `pydantic` supports and fail at import with a version-mismatch error.
+- **Claude Code has no Android build at all** — not an auth issue, a
+  packaging one. `claude_agent_sdk` has exactly one transport
+  (`subprocess_cli.py`) and always spawns the `claude` binary via
+  `shutil.which("claude")`; the npm package's postinstall only has
+  binaries for `linux-arm64`/`-musl`, `darwin-*`, `win32-*` — no
+  `android` target. Fix: `pkg install proot-distro && proot-distro install
+  ubuntu` (a real glibc chroot, reports as plain Linux to npm's platform
+  check), install node + `@anthropic-ai/claude-code` *inside* that chroot,
+  then put a tiny wrapper script at Termux's own
+  `$PREFIX/bin/claude` so `shutil.which("claude")` on the Termux side
+  resolves to it:
+  ```sh
+  #!/data/data/com.termux/files/usr/bin/bash
+  exec proot-distro login ubuntu -u claude -- claude "$@"
+  ```
+  (`backend_server.py`/`peers.py` themselves stay on Termux's native
+  Python — only the `claude` binary itself needs to run inside the chroot.)
+- **`--dangerously-skip-permissions` (our `bypassPermissions` mode) refuses
+  to run as root** — and proot's default identity inside the chroot *is*
+  root. Fix: `useradd -m -s /bin/bash claude` inside the chroot once, and
+  point the wrapper's `proot-distro login` at `-u claude` (as above) instead
+  of the default root login. Each user has its own `~/.claude/` config, so
+  this new user needs its own one-time interactive `claude` → `/login`.
+- **Android kills backgrounded processes** — `termux-wake-lock` (from the
+  `termux-api` package) before any long-running install/server keeps the
+  CPU from sleeping mid-build and stops Doze from killing `sshd`/
+  `backend_server.py` between messages. Still worth the Termux:Boot addon
+  + a battery-optimization exemption for real unattended uptime; a phone
+  that gets its screen off for hours can still lose its SSH session even
+  with the wake-lock held, and needs Termux reopened by hand to come back
+  (confirmed live — one of the two phones dropped mid-session this way).
+
 ## Next steps to explore
 
 - Give non-lead peers their own light admin power (e.g. hiring a specialist
@@ -200,8 +255,8 @@ turn actually *executes*:
   currently in-memory only, lost on process restart.
 - Tune `MAX_MESSAGES_PER_DISCUSSION` based on real usage once cost patterns
   are visible.
-- Harden a Termux-based phone backend: `termux-wake-lock`, the Termux:Boot
-  addon, and a battery-optimization exemption — Android will otherwise kill
-  a background `backend_server.py` process (see the plan doc for detail).
-  Bring up laptop2 as a remote backend first; phones are the least reliable
-  device and should be last.
+- Termux:Boot + battery-optimization exemption on both phones, so
+  `backend_server.py` survives a real device reboot/deep-sleep unattended
+  instead of needing Termux reopened by hand.
+- Syncthing (or `git pull`) to actually distribute `projects/` to the
+  phones — verified today by `scp`, not yet wired up for real.
