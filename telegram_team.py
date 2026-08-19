@@ -33,7 +33,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
-from discovery import discover_projects, load_devices
+from discovery import discover_projects, load_assignments
 from peers import AgentPeer, RemotePeer
 from prompts import GROUPCHAT_RULES, LEAD_GROUPCHAT_PROMPT, make_peer_prompt as _make_peer_prompt
 
@@ -253,18 +253,19 @@ class ChatSession:
         very next message, no restart needed. Never touches lead or a
         manually hired teammate, only role_keys this method itself added."""
         manifests = discover_projects(PROJECTS_DIR)
-        devices, assignments = load_devices(DEVICES_PATH)
+        assignments = load_assignments(DEVICES_PATH)
 
         for key, manifest in manifests.items():
             if key in self.peers:
                 continue  # already live -- don't reconnect mid-conversation
-            device = assignments.get(key, "local")
-            addr = devices.get(device)
+            device_id = assignments.get(key, "local")
             self.role_name[key] = manifest.name
             self.role_desc[key] = manifest.description
             self.role_emoji[key] = manifest.emoji or DEFAULT_EMOJI
-            if addr:
-                self.peers[key] = RemotePeer(role_key=key, base_url=addr, shared_secret=SHARED_SECRET)
+            if device_id and device_id != "local":
+                # No LAN address stored -- RemotePeer resolves device_id's
+                # current IP live via the discovery beacon on every call.
+                self.peers[key] = RemotePeer(role_key=key, device_id=device_id, shared_secret=SHARED_SECRET)
             else:
                 self.peers[key] = AgentPeer(
                     role_key=key,
@@ -315,7 +316,18 @@ class ChatSession:
 
         while posted < MAX_MESSAGES_PER_DISCUSSION and not self.wrap_up:
             round_had_speech = False
-            for role_key in list(self.peers.keys()):
+            # Lead goes LAST every round, not first. It's always inserted
+            # into self.peers before any discovered/hired teammate, so
+            # dict order alone would have it speak first every time --
+            # confirmed live: lead pre-empted a domain question with its
+            # own generic guess, and the actual expert peer (already
+            # correct in isolation) then saw the question as "already
+            # answered" and deferred instead of restating it. Peers should
+            # get first crack; lead reacts/coordinates after hearing them.
+            ordered_keys = [k for k in self.peers if k != LEAD_KEY] + (
+                [LEAD_KEY] if LEAD_KEY in self.peers else []
+            )
+            for role_key in ordered_keys:
                 if posted >= MAX_MESSAGES_PER_DISCUSSION or self.wrap_up:
                     break
                 delta = delta_for(role_key)

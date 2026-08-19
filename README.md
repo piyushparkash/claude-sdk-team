@@ -188,9 +188,9 @@ turn actually *executes*:
   discovered project peer gets the same "can't be closed out before its
   debut turn" guard (`newly_hired`) that a manual hire already gets.
 - Distributing the actual project folders to every device is a deployment
-  concern, not code: point Syncthing (or `git pull`) at the shared
-  `projects/` root so laptop2 and both phones end up with the same tree at
-  the same relative path.
+  concern, not code — this laptop and both phones are set up with a live
+  3-way Syncthing share of `projects/` (see below), so the tree is
+  identical at the same relative path on all three already.
 
 ## Running a backend on an Android phone (Termux)
 
@@ -256,7 +256,34 @@ documenting since none of it is obvious going in:
 - Tune `MAX_MESSAGES_PER_DISCUSSION` based on real usage once cost patterns
   are visible.
 - Termux:Boot + battery-optimization exemption on both phones, so
-  `backend_server.py` survives a real device reboot/deep-sleep unattended
-  instead of needing Termux reopened by hand.
-- Syncthing (or `git pull`) to actually distribute `projects/` to the
-  phones — verified today by `scp`, not yet wired up for real.
+  `backend_server.py` (and Syncthing) survive a real device reboot/deep-sleep
+  unattended instead of needing Termux reopened by hand.
+- A Windows auto-start for Syncthing on this laptop (currently started
+  manually via `syncthing serve --no-browser`) — no service wrapper set up
+  yet, so it needs restarting after a reboot.
+
+## Syncing `projects/` across devices: Syncthing
+
+Live and verified: this laptop, phone1, and phone2 are all in a 3-way
+`sendreceive` share of the `projects/` folder (folder ID `projects`) —
+edit/add/delete a file on any one device, it propagates to the other two
+within seconds. Confirmed both directions, including deletes.
+
+- Windows: `syncthing serve --no-browser`, config/API at
+  `%LOCALAPPDATA%\Syncthing` (GUI on `http://127.0.0.1:8384`, no TLS by
+  default on a fresh install).
+- Termux (`pkg install syncthing`): same command, config at
+  `~/.local/state/syncthing` (GUI on `https://127.0.0.1:8384`, self-signed
+  — `curl -k` for local API calls).
+- Devices and the folder share were set up device-to-device via each
+  instance's own REST API (`PUT /rest/config/devices/<id>`, `PUT
+  /rest/config/folders/projects`) rather than the GUI's pairing-request
+  flow — scriptable over SSH for the two headless phones, no browser
+  needed on either end. Each side lists the *other* two devices/folder
+  membership; a device never needs to add itself.
+- Addresses are explicit LAN IPs (`tcp://192.168.1.X:22000`), not
+  `dynamic` — all three devices are expected to stay on the same home
+  wifi, so this skips relying on discovery servers.
+- Not yet done: Termux:Boot so Syncthing (and `backend_server.py`) restart
+  automatically after a phone reboots, and a real Windows service wrapper
+  for this laptop instead of a manually-started process.

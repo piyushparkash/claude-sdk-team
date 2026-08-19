@@ -7,5 +7,7 @@ backend.log
 devices.json
 projects/*/
 !projects/README.md
+projects/.stignore
+projects/~syncthing~*
 .claude/
 sql-parser-ui/

@@ -15,6 +15,7 @@ from typing import Awaitable, Callable
 
 import httpx
 
+import beacon
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -129,20 +130,27 @@ def _clean_reply(text: str) -> str | None:
 
 class RemotePeer:
     """Same interface as AgentPeer, but the actual turn runs on another
-    device's backend_server.py over the LAN. An unreachable device is
-    treated like a PASS for that turn -- don't stall the whole discussion
-    on one offline machine."""
+    device's backend_server.py over the LAN. No LAN address is stored --
+    every call resolves the device's current IP live via the discovery
+    beacon (beacon.py), so a router restart / DHCP change can't break it.
+    An unreachable or non-responding device is treated like a PASS for
+    that turn -- don't stall the whole discussion on one offline machine."""
 
-    def __init__(self, role_key: str, base_url: str, shared_secret: str | None = None,
-                 timeout: float = 120.0):
+    def __init__(self, role_key: str, device_id: str, shared_secret: str | None = None,
+                 timeout: float = 120.0, discover_timeout: float = 2.0):
         self.role_key = role_key
-        self.base_url = base_url.rstrip("/")
+        self.device_id = device_id
         self.shared_secret = shared_secret
         self.timeout = timeout
+        self.discover_timeout = discover_timeout
 
     async def say(self, incoming: str, on_note: NoteFn = None) -> str | None:
+        base_url = await beacon.discover(self.device_id, timeout=self.discover_timeout)
+        if base_url is None:
+            print(f"[remote:{self.role_key}] device '{self.device_id}' didn't answer the beacon, treating as PASS")
+            return None
         headers = {"X-Team-Secret": self.shared_secret} if self.shared_secret else {}
-        url = f"{self.base_url}/peer/{self.role_key}/message"
+        url = f"{base_url}/peer/{self.role_key}/message"
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 async with client.stream("POST", url, json={"text": incoming}, headers=headers) as resp:

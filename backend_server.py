@@ -16,7 +16,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from discovery import discover_projects, load_devices
+import beacon
+from discovery import discover_projects, load_assignments
 from peers import AgentPeer
 from prompts import make_peer_prompt
 
@@ -28,7 +29,7 @@ HOST = os.environ.get("BACKEND_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BACKEND_PORT", "8800"))
 
 if not DEVICE_ID:
-    raise SystemExit("Set DEVICE_ID (must match a key in devices.json's 'devices' map).")
+    raise SystemExit("Set DEVICE_ID (an id you'll use in devices.json's 'assignments' map).")
 
 app = FastAPI()
 peers: dict[str, AgentPeer] = {}
@@ -39,7 +40,7 @@ async def _rebuild_peers() -> None:
     new ones, drop peers whose project/assignment disappeared. Mirrors the
     orchestrator's own per-message rescan (see ChatSession.handle_human_message)."""
     manifests = discover_projects(PROJECTS_DIR)
-    _devices, assignments = load_devices(DEVICES_PATH)
+    assignments = load_assignments(DEVICES_PATH)
     mine = {key for key, device in assignments.items() if device == DEVICE_ID}
 
     for key in list(peers):
@@ -103,10 +104,24 @@ async def message(role_key: str, request: Request) -> StreamingResponse:
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+async def _run() -> None:
+    await _rebuild_peers()
+    print(f"[backend:{DEVICE_ID}] peers: {list(peers.keys())}, serving on {HOST}:{PORT}, "
+          f"beacon on UDP {beacon.DISCOVERY_PORT}")
+    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    # The beacon is what lets the orchestrator find this device's current IP
+    # without a stored address anywhere (see beacon.py) -- it has to be
+    # alive for as long as the HTTP server is, so both run as one asyncio
+    # task set instead of the beacon being an afterthought.
+    await asyncio.gather(
+        server.serve(),
+        beacon.serve(DEVICE_ID, PORT),
+    )
+
+
 def main() -> None:
-    asyncio.run(_rebuild_peers())
-    print(f"[backend:{DEVICE_ID}] peers: {list(peers.keys())}, serving on {HOST}:{PORT}")
-    uvicorn.run(app, host=HOST, port=PORT)
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

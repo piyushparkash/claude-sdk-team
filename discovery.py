@@ -6,7 +6,10 @@ hand-editing a peer list when a new project folder shows up.
 Manifest is device-agnostic on purpose -- the project folder itself gets
 synced byte-for-byte to every device (e.g. via Syncthing), so a manifest
 that's identical on all copies can't sensibly also declare which device owns
-it. That lives in devices.json instead (see load_devices below).
+it. That lives in devices.json instead (see load_assignments below) --
+which device_id maps to which LAN address is never stored anywhere; it's
+resolved live via beacon.discover() so a router restart / DHCP change can't
+break it (see beacon.py).
 """
 
 from __future__ import annotations
@@ -72,14 +75,13 @@ def discover_projects(root: str) -> dict[str, ProjectManifest]:
     return found
 
 
-def load_devices(path: str) -> tuple[dict[str, str | None], dict[str, str]]:
-    """Reads devices.json -> (devices: device_id -> LAN address or None for
-    local, assignments: project_key -> device_id). Missing file = no remote
-    devices configured, everything discovered runs local."""
+def load_assignments(path: str) -> dict[str, str]:
+    """Reads devices.json -> {project_key: device_id}. A project with no
+    entry (or an entry of "local"/missing) runs in the local process;
+    anything else is a device_id resolved live via beacon.discover() --
+    no LAN address is ever stored here, so it can't go stale."""
     if not os.path.isfile(path):
-        return {"local": None}, {}
+        return {}
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    devices = data.get("devices", {"local": None})
-    assignments = data.get("assignments", {})
-    return devices, assignments
+    return data.get("assignments", {})
