@@ -1,7 +1,16 @@
 """
 Execution backend: runs on a remote device (laptop2, a phone via Termux),
-hosts one or more AgentPeers assigned to this device (per devices.json),
-exposes them over HTTP/SSE for the orchestrator to call.
+lazily hosts an AgentPeer for whichever project the orchestrator actually
+asks for, exposed over HTTP/SSE.
+
+Placement (which project runs on which device) is decided by the
+orchestrator, not here -- since every device gets an identical copy of
+`projects/` via Syncthing, any device can serve any project it's asked
+about. That's what makes placement possible to automate at all: the
+orchestrator round-robins across a declared roster of device_ids, live-
+checking via the discovery beacon which one actually answers right now,
+and just calls that device -- no per-device "am I assigned this?" bookkeeping
+needed here.
 
 Run: DEVICE_ID=laptop2 PROJECTS_DIR=... python backend_server.py
 """
@@ -17,48 +26,41 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 import beacon
-from discovery import discover_projects, load_assignments
+from discovery import discover_projects
 from peers import AgentPeer
 from prompts import make_peer_prompt
 
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects"))
-DEVICES_PATH = os.environ.get("DEVICES_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.json"))
 DEVICE_ID = os.environ.get("DEVICE_ID")
 SHARED_SECRET = os.environ.get("TEAM_SHARED_SECRET")
 HOST = os.environ.get("BACKEND_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BACKEND_PORT", "8800"))
 
 if not DEVICE_ID:
-    raise SystemExit("Set DEVICE_ID (an id you'll use in devices.json's 'assignments' map).")
+    raise SystemExit("Set DEVICE_ID (an id used in devices.json's 'roster' list).")
 
 app = FastAPI()
 peers: dict[str, AgentPeer] = {}
 
 
-async def _rebuild_peers() -> None:
-    """Discover projects assigned to THIS device, create AgentPeers for any
-    new ones, drop peers whose project/assignment disappeared. Mirrors the
-    orchestrator's own per-message rescan (see ChatSession.handle_human_message)."""
-    manifests = discover_projects(PROJECTS_DIR)
-    assignments = load_assignments(DEVICES_PATH)
-    mine = {key for key, device in assignments.items() if device == DEVICE_ID}
-
-    for key in list(peers):
-        if key not in mine or key not in manifests:
-            print(f"[backend:{DEVICE_ID}] dropping peer '{key}' (no longer assigned/present)")
-            await peers.pop(key).disconnect()
-
-    for key in mine:
-        manifest = manifests.get(key)
-        if manifest is None or key in peers:
-            continue
-        print(f"[backend:{DEVICE_ID}] adding peer '{key}' ({manifest.name})")
-        peers[key] = AgentPeer(
-            role_key=key,
-            system_prompt=make_peer_prompt(key, manifest.description, manifest.prompt),
-            tools=manifest.tools,
-            cwd=manifest.cwd,
-        )
+async def _ensure_peer(role_key: str) -> AgentPeer | None:
+    """Lazily instantiate a peer for `role_key` the first time it's asked
+    for. Returns None if no such project exists locally (its files haven't
+    synced here yet, or the key is just wrong) -- the caller treats that as
+    a 404, same as an offline device from the orchestrator's point of view."""
+    if role_key in peers:
+        return peers[role_key]
+    manifest = discover_projects(PROJECTS_DIR).get(role_key)
+    if manifest is None:
+        return None
+    print(f"[backend:{DEVICE_ID}] instantiating peer '{role_key}' ({manifest.name})")
+    peers[role_key] = AgentPeer(
+        role_key=role_key,
+        system_prompt=make_peer_prompt(role_key, manifest.description, manifest.prompt),
+        tools=manifest.tools,
+        cwd=manifest.cwd,
+    )
+    return peers[role_key]
 
 
 def _check_secret(request: Request) -> None:
@@ -69,15 +71,14 @@ def _check_secret(request: Request) -> None:
 @app.get("/health")
 async def health(request: Request) -> dict:
     _check_secret(request)
-    await _rebuild_peers()
-    return {"status": "ok", "device": DEVICE_ID, "peers": list(peers.keys())}
+    available = list(discover_projects(PROJECTS_DIR).keys())
+    return {"status": "ok", "device": DEVICE_ID, "active_peers": list(peers.keys()), "available_projects": available}
 
 
 @app.post("/peer/{role_key}/message")
 async def message(role_key: str, request: Request) -> StreamingResponse:
     _check_secret(request)
-    await _rebuild_peers()
-    peer = peers.get(role_key)
+    peer = await _ensure_peer(role_key)
     if peer is None:
         raise HTTPException(status_code=404, detail=f"no peer '{role_key}' on this device")
     body = await request.json()
@@ -105,9 +106,9 @@ async def message(role_key: str, request: Request) -> StreamingResponse:
 
 
 async def _run() -> None:
-    await _rebuild_peers()
-    print(f"[backend:{DEVICE_ID}] peers: {list(peers.keys())}, serving on {HOST}:{PORT}, "
-          f"beacon on UDP {beacon.DISCOVERY_PORT}")
+    available = list(discover_projects(PROJECTS_DIR).keys())
+    print(f"[backend:{DEVICE_ID}] projects available to serve: {available}, "
+          f"serving on {HOST}:{PORT}, beacon on UDP {beacon.DISCOVERY_PORT}")
     config = uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
     server = uvicorn.Server(config)
     # The beacon is what lets the orchestrator find this device's current IP

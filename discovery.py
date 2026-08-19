@@ -75,13 +75,26 @@ def discover_projects(root: str) -> dict[str, ProjectManifest]:
     return found
 
 
-def load_assignments(path: str) -> dict[str, str]:
-    """Reads devices.json -> {project_key: device_id}. A project with no
-    entry (or an entry of "local"/missing) runs in the local process;
-    anything else is a device_id resolved live via beacon.discover() --
-    no LAN address is ever stored here, so it can't go stale."""
+def load_device_config(path: str) -> tuple[list[str], dict[str, str]]:
+    """Reads devices.json -> (roster, overrides).
+
+    `roster` is device_ids in placement preference order (phones before the
+    laptop, per the "phones first, laptop last" policy) -- a NEWLY
+    discovered project with no override gets auto-placed on the first
+    roster device that actually answers the discovery beacon right now,
+    round-robining across candidates so repeat auto-placements spread out
+    instead of piling onto the same device. Falls back to local only if
+    nothing in the roster responds.
+
+    `overrides` is {project_key: device_id} for pinning a specific project
+    to a specific device by hand when auto-placement isn't what you want --
+    "local" or an unlisted project both mean "let auto-placement decide."
+    Neither ever stores a LAN address; that's resolved live via
+    beacon.discover() so a router restart or DHCP change can't break it."""
     if not os.path.isfile(path):
-        return {}
+        return [], {}
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data.get("assignments", {})
+    return data.get("roster", []), data.get("overrides", {})
+
+

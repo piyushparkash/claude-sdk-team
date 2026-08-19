@@ -1,7 +1,7 @@
 {
-  "_comment": "Copy to devices.json (gitignored -- per-install config, not synced with the projects). 'assignments' maps a project's manifest 'key' to a device_id -- omit a project, or set it to 'local', and it runs in the orchestrator's own process. Any other value must match the DEVICE_ID a backend_server.py on that device was started with. No LAN address is stored anywhere: RemotePeer finds a device_id's current IP live via the UDP discovery beacon (beacon.py) on every call, so a router restart or DHCP lease change never breaks this file.",
-  "assignments": {
-    "finance": "local",
-    "recipes": "phone1"
+  "_comment": "Copy to devices.json (gitignored -- per-install config, not synced with the projects). 'roster' is device_ids in placement preference order (phones before the laptop). A newly discovered project with no override in 'overrides' gets auto-placed on the first roster device that actually answers the discovery beacon right now, round-robining across candidates -- falls back to local only if nothing in the roster responds. 'overrides' pins a specific project's manifest 'key' to a specific device_id by hand, bypassing auto-placement for just that project; 'local' or omitting a project both mean 'let auto-placement decide.' No LAN address is ever stored anywhere: RemotePeer resolves a device_id's current IP live via the UDP discovery beacon (beacon.py) on every call, so a router restart or DHCP lease change never breaks this file.",
+  "roster": ["phone1", "phone2"],
+  "overrides": {
+    "finance": "local"
   }
 }

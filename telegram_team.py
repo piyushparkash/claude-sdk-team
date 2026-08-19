@@ -33,7 +33,8 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
-from discovery import discover_projects, load_assignments
+import beacon
+from discovery import discover_projects, load_device_config
 from peers import AgentPeer, RemotePeer
 from prompts import GROUPCHAT_RULES, LEAD_GROUPCHAT_PROMPT, make_peer_prompt as _make_peer_prompt
 
@@ -148,6 +149,12 @@ class ChatSession:
         # -- lets the rescan drop a peer whose project folder disappeared
         # without ever touching lead or a manually hired teammate.
         self.discovered_keys: set[str] = set()
+        # Round-robin cursor for auto-placement across devices.json's
+        # roster -- advances only past devices that actually got picked
+        # (not past ones skipped for being offline), so repeat auto-
+        # placements spread out across the roster instead of always
+        # retrying from the front.
+        self._roster_cursor = 0
 
         self.admin_server = create_sdk_mcp_server(
             name="team-admin", version="1.0.0", tools=self._make_admin_tools()
@@ -157,6 +164,11 @@ class ChatSession:
             system_prompt=LEAD_GROUPCHAT_PROMPT,
             tools=[],  # no Read/Write/Bash/web -- coordinates, doesn't execute
             cwd=PROJECT_DIR,
+            # Antigravity has no equivalent hard tool restriction to enforce
+            # this -- the lead's zero-tools guarantee only holds under
+            # Claude's ClaudeAgentOptions.tools, so it never gets to try
+            # antigravity at all, not even as a first attempt.
+            allow_antigravity=False,
             mcp_tool_names=[
                 "mcp__team-admin__add_teammate",
                 "mcp__team-admin__remove_teammate",
@@ -247,18 +259,43 @@ class ChatSession:
 
     # --- project auto-discovery --------------------------------------------
 
+    async def _auto_place(self, roster: list[str]) -> str:
+        """Round-robin across `roster` (phones-first order, per devices.json),
+        skipping any device that doesn't answer the discovery beacon right
+        now -- so an offline phone just gets passed over instead of eating
+        a placement. Falls back to "local" only if nothing in the roster
+        responds. This is what removes the need to hand-edit which project
+        goes on which device: any device with Syncthing-synced project
+        files can serve any project, so placement is just "which currently-
+        live device haven't I used in a while," checked live, not
+        hardcoded."""
+        if not roster:
+            return "local"
+        n = len(roster)
+        for i in range(n):
+            candidate = roster[(self._roster_cursor + i) % n]
+            if await beacon.discover(candidate, timeout=1.5):
+                self._roster_cursor = (self._roster_cursor + i + 1) % n
+                return candidate
+        return "local"  # nothing in the roster answered -- laptop as last resort
+
     async def _rescan_projects(self) -> None:
         """Pick up new project folders (and drop ones that disappeared)
         before every discussion -- a new project.json becomes usable on the
         very next message, no restart needed. Never touches lead or a
         manually hired teammate, only role_keys this method itself added."""
         manifests = discover_projects(PROJECTS_DIR)
-        assignments = load_assignments(DEVICES_PATH)
+        roster, overrides = load_device_config(DEVICES_PATH)
 
         for key, manifest in manifests.items():
             if key in self.peers:
                 continue  # already live -- don't reconnect mid-conversation
-            device_id = assignments.get(key, "local")
+            device_id = overrides.get(key) or "local"
+            if device_id == "local" and key not in overrides:
+                # No explicit pin for this project -- auto-place it instead
+                # of defaulting to local (that default only kicks in if
+                # nothing in the roster is actually reachable right now).
+                device_id = await self._auto_place(roster)
             self.role_name[key] = manifest.name
             self.role_desc[key] = manifest.description
             self.role_emoji[key] = manifest.emoji or DEFAULT_EMOJI
