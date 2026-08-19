@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from discovery import discover_projects, load_devices
 from peers import AgentPeer
+from prompts import make_peer_prompt
 
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects"))
 DEVICES_PATH = os.environ.get("DEVICES_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.json"))
@@ -53,7 +54,7 @@ async def _rebuild_peers() -> None:
         print(f"[backend:{DEVICE_ID}] adding peer '{key}' ({manifest.name})")
         peers[key] = AgentPeer(
             role_key=key,
-            system_prompt=manifest.prompt,
+            system_prompt=make_peer_prompt(key, manifest.description, manifest.prompt),
             tools=manifest.tools,
             cwd=manifest.cwd,
         )
