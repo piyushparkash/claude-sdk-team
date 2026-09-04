@@ -1,5 +1,8 @@
 # Claude SDK Team POC
 
+![CI](https://github.com/piyushparkash/claude-sdk-team/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/github/license/piyushparkash/claude-sdk-team)
+
 Two entry points, two different architectures:
 - `team.py` — plain CLI, one-shot, fixed 3-role team, lead delegates via
   the built-in `Agent` tool (subagent spawn/dispatch).
