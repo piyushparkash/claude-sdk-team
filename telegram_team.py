@@ -974,18 +974,12 @@ class ChatSession:
             # correct in isolation) then saw the question as "already
             # answered" and deferred instead of restating it. Peers should
             # get first crack; lead reacts/coordinates after hearing them.
-            ordered_keys = [k for k in self.peers if k != LEAD_KEY and k in self.active_keys] + (
-                [LEAD_KEY] if LEAD_KEY in self.peers else []
-            )
-            for role_key in ordered_keys:
-                if posted >= MAX_MESSAGES_PER_DISCUSSION or self.wrap_up:
-                    break
-                delta = delta_for(role_key)
-                if not delta.strip():
-                    continue
+            peer_keys = [k for k in self.peers if k != LEAD_KEY and k in self.active_keys]
+
+            async def _run_peer_turn(role_key: str, delta: str):
                 peer = self.peers.get(role_key)
                 if peer is None:
-                    continue
+                    return role_key, None, None
                 self.newly_hired.discard(role_key)  # about to get its debut turn
                 # Roster block (which keeps growing as peers get added)
                 # sits at the FRONT of a first-turn delta, so a head-only
@@ -1020,20 +1014,66 @@ class ChatSession:
                     # -- see AgentPeer.reset_connection's docstring.
                     if isinstance(peer, AgentPeer):
                         await peer.reset_connection()
-                    raise RuntimeError(f"{role_key} timed out after {TURN_TIMEOUT_SECONDS}s with no response")
+                    return role_key, None, RuntimeError(
+                        f"{role_key} timed out after {TURN_TIMEOUT_SECONDS}s with no response"
+                    )
                 engine = getattr(peer, "_engine", "?")
                 _log(f"[chat {self.chat_id}] <- {role_key} [{engine}]: {(reply[:300] if reply else 'PASS')!r}")
-                reject_premature_wrapup()
-                if self.wrap_up:
-                    break
-                if reply:
-                    transcript.append((role_key, reply))
-                    self._spoken_this_discussion.add(role_key)
-                    posted += 1
-                    round_had_speech = True
-                    if role_key != LEAD_KEY:
+                return role_key, reply, None
+
+            # Peers no longer wait behind each other -- confirmed live
+            # 2026-09-04: a 24-peer roll-call took ~4 hours serially (each
+            # antigravity call taking minutes under backend load), one
+            # TURN_TIMEOUT_SECONDS-bounded call at a time with everyone else
+            # blocked behind it. Firing every active peer's turn at once
+            # instead bounds the whole round by its single slowest peer.
+            # Trade-off: peers no longer see each other's replies from
+            # WITHIN the same round (delta is a snapshot from before the
+            # round started) -- only "peers speak before lead reacts"
+            # (below) was ever load-bearing, not peer-to-peer intra-round
+            # ordering, so this doesn't change what any peer can act on.
+            if peer_keys:
+                peer_deltas = {k: delta_for(k) for k in peer_keys}
+                fireable = [k for k in peer_keys if peer_deltas[k].strip()]
+                results = await asyncio.gather(*(_run_peer_turn(k, peer_deltas[k]) for k in fireable))
+                first_error = None
+                for role_key, reply, error in results:
+                    if error is not None:
+                        first_error = first_error or error
+                        continue
+                    if posted >= MAX_MESSAGES_PER_DISCUSSION or self.wrap_up:
+                        continue
+                    reject_premature_wrapup()
+                    if self.wrap_up:
+                        continue
+                    if reply:
+                        transcript.append((role_key, reply))
+                        self._spoken_this_discussion.add(role_key)
+                        posted += 1
+                        round_had_speech = True
                         non_lead_spoke_this_round = True
-                    await self.send(role_key, reply)
+                        await self.send(role_key, reply)
+                # Surface the first timeout to the human same as before
+                # (raising out of run() into handle_message's except-Exception
+                # handler) only after every other concurrently-fired peer's
+                # result has already been processed above -- one wedged peer
+                # no longer silently swallows everyone else's replies too.
+                if first_error is not None:
+                    raise first_error
+
+            if LEAD_KEY in self.peers and posted < MAX_MESSAGES_PER_DISCUSSION and not self.wrap_up:
+                lead_delta = delta_for(LEAD_KEY)
+                if lead_delta.strip():
+                    role_key, reply, error = await _run_peer_turn(LEAD_KEY, lead_delta)
+                    if error is not None:
+                        raise error
+                    reject_premature_wrapup()
+                    if not self.wrap_up and reply:
+                        transcript.append((role_key, reply))
+                        self._spoken_this_discussion.add(role_key)
+                        posted += 1
+                        round_had_speech = True
+                        await self.send(role_key, reply)
 
             if self.wrap_up:
                 break
