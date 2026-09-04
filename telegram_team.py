@@ -296,6 +296,7 @@ class ChatSession:
                 "mcp__team-admin__remove_teammate",
                 "mcp__team-admin__report_to_human",
                 "mcp__team-admin__schedule_task",
+                "mcp__team-admin__check_back_later",
                 "mcp__team-admin__list_schedules",
                 "mcp__team-admin__cancel_schedule",
                 "mcp__team-admin__herdr",
@@ -569,6 +570,42 @@ class ChatSession:
             )}]}
 
         @tool(
+            "check_back_later",
+            "End this turn now and come back to check on something after a "
+            "delay, instead of blocking the whole discussion waiting on it "
+            "or (worse) reporting to the human before it's actually done. "
+            "Use this when something you kicked off is genuinely "
+            "long-running -- a build, a render, a scrape, waiting on a "
+            "herdr pane -- and you have a real reason to expect it needs "
+            "more than a few seconds (e.g. it told you so, or past runs of "
+            "this took a while). `delay_seconds` is how long to wait "
+            "before waking back up (pick something sane for what you're "
+            "waiting on -- don't guess wildly short or long). `note` is "
+            "what to check when you wake up -- gets delivered back to you "
+            "as a fresh message, exactly like schedule_task, so write it "
+            "as a real instruction to yourself (e.g. 'check if the "
+            "newsjargon render on ASUS finished, herdr pane wZ:p1'). "
+            "Fires once, then forgets itself -- call it again if you need "
+            "to wait some more after checking. Survives a bot restart.",
+            {"delay_seconds": int, "note": str},
+        )
+        async def check_back_later(args: dict) -> dict:
+            try:
+                entry = scheduler.add_once(self.chat_id, int(args["delay_seconds"]), args["note"])
+            except Exception as exc:
+                return {"content": [{"type": "text", "text": f"Couldn't schedule check-back: {exc}"}], "is_error": True}
+            _log(f"[chat {self.chat_id}] check_back_later {entry['id']}: in {args['delay_seconds']}s -> {entry['message']!r}")
+            self.wrap_up = True
+            self.final_summary = (
+                f"Checking back in ~{args['delay_seconds']}s ({args['note']}) -- "
+                "will update you once I know more."
+            )
+            return {"content": [{"type": "text", "text": (
+                f"Scheduled check-back (id {entry['id']}) in {args['delay_seconds']}s. "
+                "Ending this turn now."
+            )}]}
+
+        @tool(
             "list_schedules",
             "List every recurring schedule currently active in this chat "
             "(id, cron expression, message, next run time).",
@@ -579,7 +616,7 @@ class ChatSession:
             if not entries:
                 return {"content": [{"type": "text", "text": "No schedules in this chat."}]}
             lines = [
-                f"- {e['id']}: {e['cron']} -> {e['message']!r} (next: {e['next_run']})"
+                f"- {e['id']}: {e['cron'] or 'once'} -> {e['message']!r} (next: {e['next_run']})"
                 for e in entries
             ]
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
@@ -811,7 +848,7 @@ class ChatSession:
             )}]}
 
         tools = [add_teammate, invite_peers, remove_teammate, report_to_human,
-                 schedule_task, list_schedules, cancel_schedule,
+                 schedule_task, check_back_later, list_schedules, cancel_schedule,
                  grant_tool_access, set_closing_reviewer, compact_peer, restart_self]
         # herdr controls coding sessions on THIS machine -- only meaningful
         # (and only actually reachable) where the herdr CLI itself is
